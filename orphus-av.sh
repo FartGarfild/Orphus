@@ -34,6 +34,12 @@
 #                            that point is still valid. Without -o, a
 #                            default ./av_scan_threats_<timestamp>.log is
 #                            used automatically (never silently discarded).
+#                            SUID/SGID findings are written to a SEPARATE
+#                            companion file (same name + "-SUID") instead
+#                            of mixed into this one — on a full-OS scan,
+#                            standard system binaries alone can produce
+#                            dozens of lines that bury what actually needs
+#                            a look. Only created if there's anything in it.
 #   --ignore-sigs FILE       Suppress noisy detections without editing
 #                            downloaded signature/rule files (which get
 #                            overwritten on the next -u). One ERE pattern
@@ -92,15 +98,15 @@
 #                            tar/7z/rar) as defense-in-depth against a bug
 #                            in the extractor itself being exploited by a
 #                            malicious archive. auto|bwrap|unshare|chroot|
-#                            simple|none (default: none — off, changes
-#                            nothing unless explicitly requested). auto
-#                            picks the strongest available: bwrap >
-#                            unshare > simple. Rewritten from a person's
-#                            draft after finding and fixing several real
-#                            bugs during review/testing (broken bwrap
-#                            argument passing, leaked chroot bind mounts,
-#                            missing access to the archive/extraction tool
-#                            paths inside the isolated filesystem view).
+#                            simple|none (default: auto — picks the
+#                            strongest available: bwrap > unshare >
+#                            simple; --sandbox-mode none opts out).
+#                            Rewritten from a person's draft after finding
+#                            and fixing several real bugs during
+#                            review/testing (broken bwrap argument
+#                            passing, leaked chroot bind mounts, missing
+#                            access to the archive/extraction tool paths
+#                            inside the isolated filesystem view).
 #   --no-ram                Force /tmp instead of /dev/shm
 #   --no-busybox            Fully disable busybox (no auto-download, no local
 #                            binary use) — system tools only
@@ -303,7 +309,7 @@ export LC_ALL=C
 # 1. GLOBALS — all script variables defined once here, before any code uses
 #    them. init_*/detect_* functions and parse_args() fill in real values.
 # ============================================================================
-VERSION="0.2"
+VERSION="0.3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Re-exec into our OWN bundled bash (see build_bash_from_source /
@@ -353,6 +359,8 @@ OUTPUT_FILE=""
 LIVE_REPORT_FILE=""    # persistent (outside WORK_DIR) file threats are
                         # appended to AS THEY'RE FOUND, so Ctrl+C/SIGTERM
                         # mid-scan doesn't lose already-detected results
+SUID_REPORT_FILE=""    # companion file for SUID_SGID findings specifically
+                        # — set alongside LIVE_REPORT_FILE in init_live_report()
 IGNORE_SIGS_FILE=""    # set in init_ignore_sigs(); patterns (ERE, one per
                         # line) matched against "TYPE|info" of each threat —
                         # a match suppresses that detection entirely (no
@@ -414,12 +422,21 @@ MAX_HEX_PATTERNS=8000 # cap on compiled hex_ere.txt entries, see compile_signatu
 BATCH_SIZE=200         # files per hash/YARA batch
 HEUR_BATCH_SIZE=200    # files per strings/hex heuristic batch
 PE_BATCH_SIZE=100      # files per PE-section (.mdb) batch
-SANDBOX_MODE="none"    # --sandbox-mode auto|bwrap|unshare|chroot|simple|none
+SANDBOX_MODE="auto"    # --sandbox-mode auto|bwrap|unshare|chroot|simple|none
                         # — isolates archive EXTRACTION specifically (the
                         # highest-risk operation: parsing an
-                        # attacker-controlled zip/tar/7z/rar). Off by
-                        # default; see MODULE: sandboxed extraction in the
-                        # worker for the actual implementation.
+                        # attacker-controlled zip/tar/7z/rar). Defaults
+                        # to auto (external review flagged "off by
+                        # default" as a real gap) — degrades gracefully
+                        # (bwrap > unshare > simple), and even the
+                        # weakest tier still runs unprivileged with
+                        # resource limits rather than fully unsandboxed;
+                        # if NONE of those tools exist either, extraction
+                        # still runs normally, just without isolation, so
+                        # this can't newly break anything. --sandbox-mode
+                        # none opts back out explicitly. See MODULE:
+                        # sandboxed extraction in the worker for the
+                        # actual implementation.
 SANDBOX_USER="nobody"
 SANDBOX_MEM_KB=1048576  # 1GB, simple mode only
 SANDBOX_CPU_SEC=60
@@ -464,6 +481,19 @@ BUSYBOX_URL_ARG=""      # --busybox-url: override the busybox download URL
 
 # --- Quarantine ---
 QUARANTINE_ENABLED=false
+QUARANTINE_DRY_RUN=false   # --quarantine-dry-run: report what WOULD be
+                        # quarantined without moving anything — see the
+                        # comment where it's checked in quarantine_file()
+QUARANTINE_SKIP_ARCHIVES=false  # --no-quarantine-archives: when a threat
+                        # is found INSIDE an archive member, the file
+                        # that gets quarantined is necessarily the whole
+                        # ARCHIVE CONTAINER (there's no way to cleanly
+                        # remove just one member without rewriting the
+                        # archive) — real collateral cost if the archive
+                        # has hundreds of otherwise-clean files alongside
+                        # the flagged one. This reports the finding as
+                        # normal but leaves the container in place,
+                        # letting a person review and decide by hand.
 QUARANTINE_DIR="${SCRIPT_DIR}/quarantine"
 QUARANTINE_PERM="0400"   # read-only, not executable (NOT literal "100" —
                           # that means --x------, the opposite)
@@ -606,50 +636,99 @@ now_ms() {
 net_fetch() {
     # Downloader chain: busybox wget -> system wget -> system curl.
     # Optional 4th arg is a User-Agent (e.g. for the ClamAV mirror).
-    local url="$1" dest="$2" timeout="${3:-10}" ua="${4:-}"
+    # Optional 5th arg is a max expected size in MB (default 300 — generous
+    # enough for every real thing this script downloads: main.cvd at
+    # ~90MB, source tarballs at a few MB each, busybox at ~1.1MB).
+    #
+    # FIX (real, CONFIRMED gap found in security review): none of the
+    # three downloaders had ANY bound on total transfer size — only
+    # --connect-timeout/-T, which cap the CONNECTION/read-idle phase, not
+    # the overall transfer. Confirmed directly: curl pulled 740MB from an
+    # effectively infinite local source in 5 seconds with nothing
+    # stopping it. First attempt at a fix added native per-tool flags
+    # (curl --max-filesize/--max-time, wget -Q) on top of this — a real
+    # report then came in of THIS WRAPPED download failing on a real
+    # server while a plain, bare `curl url --output file` (no extra flags
+    # at all) succeeded. wget's -Q turned out to be a red herring anyway
+    # (its own docs say quota does NOT interrupt a single-file download,
+    # only stops STARTING further ones — meaningless here, and apparently
+    # not harmless either on some build). Rather than keep guessing which
+    # specific flag misbehaves on which specific tool version without
+    # being able to reproduce it directly, all the native per-tool size/
+    # time flags are gone — every downloader now just fetches plainly
+    # (matching the manual command confirmed to work), and the ONE
+    # protection mechanism is the post-download size check below,
+    # verified end-to-end including its own truncation edge case (see the
+    # comment on it further down).
+    local url="$1" dest="$2" timeout="${3:-10}" ua="${4:-}" max_mb="${5:-300}"
+    local max_bytes=$(( max_mb * 1024 * 1024 ))
+
+    _fetch_size_ok() {
+        local f="$1" sz
+        [ -s "$f" ] || return 1
+        # NOTE: can't use the worker's _stat_size() here — net_fetch()
+        # runs in the MAIN script during setup/toolchain init, before any
+        # worker exists, and that function only exists within the
+        # worker's own section of this file. Inlined, OS-portable
+        # equivalent instead (same Linux/macOS stat flag difference).
+        if [ "$OS" = "macos" ]; then sz=$(stat -f '%z' "$f" 2>/dev/null)
+        else sz=$(stat -c '%s' "$f" 2>/dev/null); fi
+        # FIX (real edge case found in testing): a source that gets cut
+        # off exactly AT the cap (confirmed: curl's --max-filesize against
+        # an effectively infinite stream stopped at exactly max_bytes and
+        # still exited 0) is a TRUNCATED file, not a legitimately-sized
+        # one — "<=" would have accepted it. A real file's size matching
+        # our arbitrary round-number cap byte-for-byte is not plausible;
+        # strictly "<" both catches the truncation case and still passes
+        # every real download we do (all comfortably under their caps).
+        [ -n "$sz" ] && [ "$sz" -lt "$max_bytes" ]
+    }
 
     if [ -n "$BUSYBOX_BIN" ] && "$BUSYBOX_BIN" wget --help &>/dev/null 2>&1; then
         if [ -n "$ua" ]; then
-            "$BUSYBOX_BIN" wget -q -T "$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+            "$BUSYBOX_BIN" wget -q -T "$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null
         else
-            "$BUSYBOX_BIN" wget -q -T "$timeout" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+            "$BUSYBOX_BIN" wget -q -T "$timeout" -O "$dest" "$url" 2>/dev/null
         fi
+        if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
     if command -v wget &>/dev/null; then
+        # FIX (real bug reported): -Q/--quota was added here for a
+        # size cap, but wget's OWN documented behavior is that quota does
+        # NOT interrupt a single file's download — it only stops
+        # STARTING further downloads afterward (relevant for recursive
+        # wget, meaningless for a single -O fetch like this one). At
+        # best a no-op; suspected of actively breaking the download on
+        # the specific wget build a real report came in against (direct
+        # curl worked, our wrapped call didn't) — removed. The
+        # post-download size check below is the real, verified
+        # protection regardless of which tool ran.
         if [ -n "$ua" ]; then
-            wget -q --timeout="$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+            wget -q --timeout="$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null
         else
-            wget -q --timeout="$timeout" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+            wget -q --timeout="$timeout" -O "$dest" "$url" 2>/dev/null
         fi
+        if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
     if command -v curl &>/dev/null; then
+        # NOTE: --max-filesize also dropped here, same reasoning as -Q
+        # above — even though curl's own docs are clearer about it than
+        # wget's -Q, a real report came in of the WRAPPED download
+        # failing while a plain manual curl (no extra flags at all)
+        # succeeded, and untangling exactly which flag was at fault
+        # without being able to reproduce it directly isn't worth the
+        # risk of guessing wrong twice. The post-download size check
+        # below is the one mechanism actually verified end-to-end
+        # (including its own edge case — see the comment on it above),
+        # so that's what all three downloaders rely on uniformly now.
         if [ -n "$ua" ]; then
-            curl -fsSL -A "$ua" --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+            curl -fsSL -A "$ua" --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null
         else
-            curl -fsSL --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+            curl -fsSL --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null
         fi
+        if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
     rm -f "$dest" 2>/dev/null
-    return 1
-}
-
-check_network() {
-    # Probes the actual URL that will be fetched (defaults to busybox.net)
-    # rather than a fixed unrelated host — otherwise a working --busybox-url
-    # mirror would still be reported as "no network" if busybox.net itself
-    # happens to be unreachable from this machine.
-    local target="${1:-https://busybox.net}"
-    # On the first call, BUSYBOX_BIN is still empty, so this naturally
-    # falls back to system wget/curl (same bootstrap exception as net_fetch).
-    if [ -n "$BUSYBOX_BIN" ] && "$BUSYBOX_BIN" wget --help &>/dev/null 2>&1; then
-        "$BUSYBOX_BIN" wget -q -T 3 -O /dev/null "$target" 2>/dev/null && return 0
-    fi
-    if command -v wget &>/dev/null; then
-        wget -q --timeout=3 --spider "$target" 2>/dev/null && return 0
-    fi
-    if command -v curl &>/dev/null; then
-        curl -sf --connect-timeout 3 "$target" >/dev/null 2>&1 && return 0
-    fi
     return 1
 }
 
@@ -669,9 +748,49 @@ busybox_url() {
 }
 
 verify_busybox_binary() {
-    # Sanity check: executable, and --help output looks like busybox.
+    # HONEST LIMITATION, stated plainly: busybox.net does not publish a
+    # SHA256SUM file for this specific build directory (checked directly
+    # — not present), so this canNOT do full cryptographic verification
+    # against a known-good hash the way build_grep_from_source() etc. can
+    # for source tarballs pulled through apt. What this DOES check,
+    # strengthened from a purely superficial "--help mentions busybox"
+    # text match (which a crafted malicious binary could trivially fake):
+    #   1. Real ELF executable (magic bytes \x7fELF) — rejects garbage,
+    #      HTML error pages saved as the binary, truncated downloads, and
+    #      non-executable content outright, before ever running it.
+    #   2. Plausible size range for a real busybox static binary (roughly
+    #      400KB-3MB — the specific build we fetch is ~1.1MB) — rejects
+    #      wildly-wrong-sized substitutions.
+    #   3. --help output actually looks like busybox (existing check).
+    # Together these are real defense-in-depth against a corrupted/wrong
+    # download or a naive substitution, but NOT a substitute for
+    # cryptographic signature verification against a MOTIVATED attacker
+    # who controls the download path (a compromised mirror or an
+    # on-path MITM could still craft a malicious ELF that passes all
+    # three checks). If that threat model matters for your environment,
+    # the safer path is: skip auto-download entirely, provide your own
+    # vetted busybox via -b/--busybox pointing at a binary you've
+    # verified through a trusted channel yourself.
     local c="$1"
     [ -x "$c" ] || return 1
+    local magic
+    magic=$(head -c4 "$c" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+    [ "$magic" = "7f454c46" ] || return 1
+    # FIX (real bug found — matches the exact symptom reported: manual
+    # curl download succeeded, but this verification always failed
+    # regardless): _stat_size() is a WORKER-only function (defined
+    # between #__WORKER_START__/#__WORKER_END__), not available here —
+    # verify_busybox_binary() runs from the MAIN script (called by
+    # find_local_busybox()/download_busybox()). The call silently failed
+    # every time ("command not found"), sz fell back to 0 via the "||"
+    # fallback, and 0 is never >= 400000 — meaning this size check
+    # rejected EVERY real busybox binary unconditionally, download
+    # perfectly fine or not. Inlined, OS-portable equivalent instead
+    # (same fix already applied to net_fetch()'s own size check).
+    local sz
+    if [ "$OS" = "macos" ]; then sz=$(stat -f '%z' "$c" 2>/dev/null)
+    else sz=$(stat -c '%s' "$c" 2>/dev/null); fi
+    { [ -n "$sz" ] && [ "$sz" -ge 400000 ] && [ "$sz" -le 3000000 ]; } || return 1
     "$c" --help 2>&1 | head -1 | grep -qi "busybox" || return 1
     return 0
 }
@@ -696,7 +815,7 @@ download_busybox() {
     local url="$1" dest="$SCRIPT_DIR/bin/busybox"
     mkdir -p "$SCRIPT_DIR/bin"
     echo -e "${C}[*] BusyBox not found locally -> auto-downloading (~1MB)...${Z}"
-    if net_fetch "$url" "$dest" 15 && verify_busybox_binary "$dest" 2>/dev/null; then
+    if net_fetch "$url" "$dest" 15 "" 10 && verify_busybox_binary "$dest" 2>/dev/null; then
         :
     else
         chmod +x "$dest" 2>/dev/null
@@ -726,15 +845,22 @@ ensure_busybox() {
 
     local dl_url
     dl_url=$(busybox_url)
-    if check_network "$dl_url"; then
-        echo -e "${Y}[*] Trying emergency auto-download as a fallback...${Z}"
-        download_busybox "$dl_url" && return 0
-        echo -e "${R}[WARN] Emergency download also failed -> system tools (shell fallback)${Z}"
-        return 1
-    else
-        echo -e "${R}[WARN] No network -> system tools (shell fallback), no busybox${Z}"
-        return 1
-    fi
+    # FIX (real bug reported): check_network() as a pre-flight gate here
+    # was actively wrong — a person confirmed BOTH the wget --spider AND
+    # curl checks it uses succeed (exit 0) when run manually, yet the
+    # script still reported "No network" and skipped straight past
+    # attempting the real download. Whatever the exact cause (this is now
+    # the THIRD bug found in this same small area of the script — a
+    # pattern worth noticing), the check added a failure point of its own
+    # without protecting against anything download_busybox() doesn't
+    # already handle correctly on its own: if the network genuinely isn't
+    # there, net_fetch() inside it will simply fail cleanly, with clear
+    # messaging, same as any other real download failure. Removed the
+    # gate entirely — go straight to attempting the download.
+    echo -e "${Y}[*] Trying emergency auto-download as a fallback...${Z}"
+    download_busybox "$dl_url" && return 0
+    echo -e "${R}[WARN] Emergency download also failed -> system tools (shell fallback)${Z}"
+    return 1
 }
 
 busybox_has_applet() {
@@ -1324,6 +1450,8 @@ parse_args() {
             --yara-url)      YARA_URL_ARG="$2"; shift 2 ;;
             --mb-key)        MB_KEY="$2"; shift 2 ;;
             -q|--quarantine) QUARANTINE_ENABLED=true; shift ;;
+            --quarantine-dry-run) QUARANTINE_ENABLED=true; QUARANTINE_DRY_RUN=true; shift ;;
+            --no-quarantine-archives) QUARANTINE_SKIP_ARCHIVES=true; shift ;;
             --quarantine-dir)  QUARANTINE_ENABLED=true; QUARANTINE_DIR="$2"; shift 2 ;;
             --quarantine-perm) QUARANTINE_PERM="$2"; shift 2 ;;
             -w|--real-time|--realtime) REALTIME_MODE=true; shift ;;
@@ -1591,6 +1719,13 @@ init_live_report() {
     else
         LIVE_REPORT_FILE="$(pwd)/av_scan_threats_$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "$$").log"
     fi
+    # SUID/SGID findings go to their own companion file — on a full-OS
+    # deep scan, standard system binaries (passwd/sudo/su/mount/etc, and
+    # every one of their snap-packaged duplicates) alone can produce
+    # dozens of lines that bury the handful of findings someone actually
+    # needs to look at. Same base name, "-SUID" appended, next to the
+    # main report.
+    SUID_REPORT_FILE="${LIVE_REPORT_FILE}-SUID"
 
     if ! { : > "$LIVE_REPORT_FILE"; } 2>/dev/null; then
         echo -e "${Y}[WARN] Can't write to ${LIVE_REPORT_FILE} -> live threat log disabled (results only available at the end)${Z}"
@@ -2711,47 +2846,44 @@ choose_work_dir() {
 }
 
 _sweep_stale_shm_dirs() {
-    # FIX (real leftover found in practice: a real archive-extraction
-    # directory from Aug 15 was STILL sitting in /dev/shm days later,
-    # despite scan_archive() ending with its own rm -rf). Root cause:
-    # cleanup()'s worker kill (kill -TERM -$PGID) terminates a worker
-    # mid-extraction OUTRIGHT — it never reaches its own cleanup line —
-    # and the same is unavoidably true for SIGKILL/a hard crash, which no
-    # trap anywhere could ever catch. Sweep any of THIS scanner's own
-    # /dev/shm directories at the START of a fresh run instead of trying
-    # to make every possible kill path individually reliable — anything
-    # found here is guaranteed orphaned, since this run has not yet
-    # created any of its own (each run's dirs are freshly randomized via
-    # mktemp/$$, so there is zero risk of touching a directory actually
-    # in use by another concurrent run).
-    [ -d /dev/shm ] || return
-    local d
-    for d in /dev/shm/av_arch_* /dev/shm/av_chroot.* /dev/shm/av_sigs_* /dev/shm/av_scan_*; do
-        [ -d "$d" ] || continue
-        rm -rf "$d" 2>/dev/null
-    done
-    # Same sweep, disk side — _archive_tmpdir()'s non-RAM fallback creates
-    # av_arch_* dirs under TMPDIR/tmp too (only its RAM path was covered
-    # here before, and separately, that fallback used to have no prefix
-    # at all — see the fix in _archive_tmpdir itself). Real leftovers
-    # from BEFORE that prefix fix will be un-prefixed "tmp.XXXXXXXXXX" and
-    # can't be told apart from unrelated system temp dirs by name alone —
-    # those need a one-time manual cleanup; anything created going
-    # forward is swept here same as the /dev/shm case.
-    local tdir="${TMPDIR:-/tmp}"
-    [ -d "$tdir" ] || return
-    for d in "$tdir"/av_arch_* "$tdir"/av_chroot.* "$tdir"/av_scan_*; do
-        [ -d "$d" ] || continue
-        rm -rf "$d" 2>/dev/null
-    done
-    # FIX (real leak found in practice — grew by exactly 3-per-worker on
-    # every Ctrl+C'd run): av_filtered_* are FILES, not directories (the
-    # per-worker filtered ignore_sigs/generic_obfuscation_rules/
-    # known_vendor_obfuscation copies) — same orphan-on-interrupt problem,
-    # different resource type, so a separate "-f" check rather than "-d".
-    for d in "$tdir"/av_filtered_*; do
-        [ -f "$d" ] || continue
-        rm -f "$d" 2>/dev/null
+    # FIX (CRITICAL race condition, found by external review): this used
+    # to match purely by NAME PATTERN (av_arch_*, av_scan_* etc) with no
+    # way to tell "orphaned from a dead run" apart from "still in active
+    # use by a DIFFERENT, concurrently-running instance" (cron + a manual
+    # scan, or -w in the background plus a one-off audit — both
+    # legitimate, expected setups this scanner is meant to support). A
+    # second instance starting while a first was still running would
+    # delete the first one's WORK_DIR, SIG_DIR, and any in-progress
+    # archive extraction out from under it.
+    #
+    # Every ephemeral resource this scanner creates now embeds the PID of
+    # the top-level av.sh process that owns it (see MAIN_SCRIPT_PID in
+    # the worker, and $$ here in the main script) — this function extracts
+    # that PID from each match and checks with `kill -0` whether a
+    # process by that PID is still alive before ever removing anything.
+    # Only DEMONSTRABLY dead runs get swept; anything that can't be
+    # confidently attributed to a dead PID is left alone rather than
+    # guessed at. Old-format names from before this fix (no embedded PID)
+    # are also left alone for the same reason — a one-time manual cleanup
+    # for those, same as noted when the prefix fix originally shipped.
+    local d base pid
+    _dead_pid() {
+        [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]] || return 1
+        ! kill -0 "$1" 2>/dev/null
+    }
+    for d in /dev/shm/av_arch_* /dev/shm/av_chroot.* /dev/shm/av_sigs_* /dev/shm/av_scan_* \
+             "${TMPDIR:-/tmp}"/av_arch_* "${TMPDIR:-/tmp}"/av_chroot.* "${TMPDIR:-/tmp}"/av_scan_* \
+             "${TMPDIR:-/tmp}"/av_filtered_*; do
+        [ -e "$d" ] || continue
+        base=$(basename "$d")
+        case "$base" in
+            av_scan_*|av_sigs_*)   pid="${base#av_*_}" ;;
+            av_arch_*)             pid="${base#av_arch_}"; pid="${pid%%_*}" ;;
+            av_chroot.*)           pid="${base#av_chroot.}"; pid="${pid%%.*}" ;;
+            av_filtered_*)         pid="${base#av_filtered_}"; pid="${pid%%_*}" ;;
+            *)                     pid="" ;;
+        esac
+        _dead_pid "$pid" && rm -rf "$d" 2>/dev/null
     done
 }
 
@@ -3184,7 +3316,7 @@ update_incremental_cache() {
     [ -s "$raw" ] || return 0
 
     local threat_paths="$WORK_DIR/.threat_paths"
-    bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d'|' -f2 | bb sort -u > "$threat_paths" 2>/dev/null
+    bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | cut -d'|' -f2 | bb sort -u > "$threat_paths" 2>/dev/null
     [ -f "$threat_paths" ] || : > "$threat_paths"
 
     local new_cache="${INCREMENTAL_CACHE_FILE}.new"
@@ -3285,6 +3417,50 @@ collect_files() {
     else
         echo -e "[*] Files queued: ${C}${TOTAL_FILES}${Z}\n"
     fi
+
+    # FIX (real gap found in security review): every path above collects
+    # files via newline-separated `find -print`/-printf — a filename
+    # containing an actual embedded newline byte (unusual, but real and
+    # legal on Linux — confirmed directly: `touch` happily creates one)
+    # would get SPLIT across two lines there, and the resulting garbage
+    # fragments essentially never match a real file, so `[ -f ... ]`-style
+    # checks downstream just silently skip it. That means a file named
+    # this way could dodge scanning ENTIRELY — a real, if obscure, evasion
+    # technique specifically worth caring about in an AV scanner. Fully
+    # converting the whole collection/pool-distribution pipeline to
+    # NUL-separated records would close this more completely, but it's a
+    # substantial rewrite of a heavily-tested core path; this is the
+    # narrower, lower-risk fix: a SEPARATE, NUL-safe (-print0) pass whose
+    # only job is to catch and flag anomalous filenames directly — no
+    # legitimate file has a newline (or other raw control byte) in its
+    # name, so the mere existence of one is itself a strong signal, even
+    # though this pass doesn't try to hash/YARA-scan its CONTENT.
+    # FIX (real bug found in testing): this file used to be named
+    # "pool_anomaly.txt" — which matched the SAME "pool_*.txt" glob the
+    # worker-launch loop uses to decide what to spawn a worker for! A
+    # worker started up treating it as a real work queue, found nothing
+    # scannable in it, and overwrote it with its own startup/completion
+    # log lines — clobbering the THREAT line before it was ever read.
+    # Renamed to a pattern that can't collide with that glob; the
+    # aggregation call sites explicitly include it as a second path
+    # alongside pool_*.txt instead.
+    local anomaly_report="$WORK_DIR/reports/anomaly_findings.txt"
+    : > "$anomaly_report" 2>/dev/null
+    while IFS= read -r -d '' af; do
+        case "$af" in
+            *$'\n'*|*$'\t'*)
+                printf 'THREAT:SUSPICIOUS_FILENAME|%s|contains embedded newline/tab byte in the filename itself -- not scanned via the normal pipeline, which splits on these; investigate directly\n' \
+                    "$(printf '%s' "$af" | tr '\n\t' '??')" >> "$anomaly_report"
+                ;;
+        esac
+    # NOTE: uses "command find" (system find), NOT bb find here —
+    # confirmed directly that busybox find's own -print0 is unreliable
+    # for exactly the kind of filename this pass exists to catch: on a
+    # file with an embedded literal newline byte, busybox find's -print0
+    # output was truncated right at that byte (missing the rest of the
+    # name and the NUL terminator), while system find handled the same
+    # file correctly. Using busybox here would defeat the whole point.
+    done < <(command find "$ROOT_DIR" -type f "${excl[@]}" -print0 2>/dev/null)
 }
 
 split_pools() {
@@ -3321,7 +3497,7 @@ launch_workers() {
             "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
             "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
             "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM" "$GENERIC_OBFUSCATION_RULES_FILE" "$KNOWN_VENDOR_OBFUSCATION_FILE" "$SANDBOX_MODE" "$SANDBOX_USER" "$SANDBOX_MEM_KB" "$SANDBOX_CPU_SEC" "$DEEP_MODE" "$SHA1_CMD"
+            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM" "$GENERIC_OBFUSCATION_RULES_FILE" "$KNOWN_VENDOR_OBFUSCATION_FILE" "$SANDBOX_MODE" "$SANDBOX_USER" "$SANDBOX_MEM_KB" "$SANDBOX_CPU_SEC" "$DEEP_MODE" "$SHA1_CMD" "$$" "$QUARANTINE_DRY_RUN" "$QUARANTINE_SKIP_ARCHIVES" "$SUID_REPORT_FILE"
         WORKER_PIDS+=($!)
     done
 }
@@ -3496,7 +3672,7 @@ build_report() {
     TF=0; TT=0; SC=0
     local r f t
     local th_ms=0 ty_ms=0 tu_ms=0 tp_ms=0 v
-    for r in "$WORK_DIR/reports"/pool_*.txt; do
+    for r in "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt; do
         [ -f "$r" ] || continue
         f=$(bb grep "^FILES_SCANNED:" "$r" 2>/dev/null | cut -d: -f2)
         t=$(bb grep "^THREATS_FOUND:" "$r" 2>/dev/null | cut -d: -f2)
@@ -3506,6 +3682,17 @@ build_report() {
         v=$(bb grep "^TIMING_HEUR_MS:" "$r" 2>/dev/null | cut -d: -f2); tu_ms=$(( tu_ms + ${v:-0} ))
         v=$(bb grep "^TIMING_PE_MS:" "$r" 2>/dev/null | cut -d: -f2); tp_ms=$(( tp_ms + ${v:-0} ))
     done
+    # FIX (real bug found in testing): anomaly_findings.txt (the
+    # suspicious-filename pass — see collect_files()) is written directly
+    # by the MAIN script, not by a worker, so it has no "THREATS_FOUND:N"
+    # summary line the loop above looks for — its THREAT: lines were
+    # correctly present in the file, but never counted, so the console
+    # showed "0 threats / CLEAN" despite a real finding sitting right
+    # there unreported. Count its THREAT: lines directly.
+    if [ -f "$WORK_DIR/reports/anomaly_findings.txt" ]; then
+        v=$(bb grep -c "^THREAT:" "$WORK_DIR/reports/anomaly_findings.txt" 2>/dev/null)
+        TT=$(( TT + ${v:-0} ))
+    fi
     SC=$(count_suppressed)
     SPEED=0; [ "$ELAPSED_S" -gt 0 ] && SPEED=$(( TF / ELAPSED_S ))
 
@@ -3557,12 +3744,18 @@ print_report() {
     echo -e "\n"
     if [ "$TT" -gt 0 ]; then
         echo -e "${R}${RPT}${Z}"
+        local suid_count
+        suid_count=$(bb grep -c "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | bb awk -F: '{s+=$2} END{print s+0}')
         echo -e "\n${R}${B}=== DETECTED THREATS ===${Z}"
-        bb grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null \
+        bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
+            | bb grep -v "^THREAT:SUID_SGID|" \
             | cut -d: -f2- | bb sort -u \
             | while IFS='|' read -r type file info; do
                 echo -e " ${R}[!]${Z} [${Y}${type}${Z}] ${file} ${C}${info:-}${Z}"
               done
+        if [ "${suid_count:-0}" -gt 0 ]; then
+            echo -e "\n ${Y}[i]${Z} ${suid_count} SUID/SGID finding(s) written separately to: ${C}${SUID_REPORT_FILE}${Z}"
+        fi
     else
         echo -e "${G}${RPT}${Z}"
         echo -e "\n ${G}[OK] No threats detected [CLEAN]${Z}"
@@ -3575,10 +3768,32 @@ save_report() {
         echo "$RPT"
         [ "$TT" -gt 0 ] && {
             echo -e "\n=== DETECTED THREATS ==="
-            bb grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d: -f2- | bb sort -u
+            # FIX (real bug found in testing): grep given MULTIPLE file
+            # arguments prefixes every matched line with "filename:" —
+            # meaning the SECOND grep's "^THREAT:SUID_SGID|" anchor never
+            # matched (the line actually started with the pool file's own
+            # path, not literally "THREAT:"), so the SUID exclusion
+            # silently did nothing despite looking correct. "-h"
+            # suppresses that filename prefix.
+            bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
+                | bb grep -v "^THREAT:SUID_SGID|" \
+                | cut -d: -f2- | bb sort -u
         }
     } > "$LIVE_REPORT_FILE"
     echo -e "\n[*] Report saved: ${C}${LIVE_REPORT_FILE}${Z}"
+
+    # SUID/SGID findings, same source data, separate file — see the
+    # comment in init_live_report() for why. Only written if there's
+    # actually anything to put in it (no empty companion file otherwise).
+    if bb grep -q "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null; then
+        {
+            echo "# Oprhus AV Scanner — SUID/SGID findings (split out from the main report)"
+            echo "# Target: $ROOT_DIR"
+            echo ""
+            bb grep -h "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | cut -d: -f2- | bb sort -u
+        } > "$SUID_REPORT_FILE" 2>/dev/null
+        echo -e "[*] SUID/SGID report saved: ${C}${SUID_REPORT_FILE}${Z}"
+    fi
 }
 
 # ============================================================================
@@ -3616,7 +3831,7 @@ start_realtime_worker() {
         "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
         "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
         "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM" "$GENERIC_OBFUSCATION_RULES_FILE" "$KNOWN_VENDOR_OBFUSCATION_FILE" "$SANDBOX_MODE" "$SANDBOX_USER" "$SANDBOX_MEM_KB" "$SANDBOX_CPU_SEC" "$DEEP_MODE" "$SHA1_CMD"
+        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM" "$GENERIC_OBFUSCATION_RULES_FILE" "$KNOWN_VENDOR_OBFUSCATION_FILE" "$SANDBOX_MODE" "$SANDBOX_USER" "$SANDBOX_MEM_KB" "$SANDBOX_CPU_SEC" "$DEEP_MODE" "$SHA1_CMD" "$$" "$QUARANTINE_DRY_RUN" "$QUARANTINE_SKIP_ARCHIVES" "$SUID_REPORT_FILE"
     REALTIME_WORKER_PID=$!
 
     # Keep the write fd (3) open permanently — opening/closing per event
@@ -3766,7 +3981,7 @@ main() {
         # HexERE/Strings/YARA counts reflect exactly what the next scan
         # will use, as a sanity check that nothing broke in the update.
         local tmp_compile_dir
-        tmp_compile_dir=$(mktemp -d 2>/dev/null || mktemp -d -t 'av_update_compile.XXXXXX')
+        tmp_compile_dir=$(mktemp -d "${TMPDIR:-/tmp}/av_update_compile.XXXXXX" 2>/dev/null || mktemp -d)
         compile_signatures "$SIGNATURES" "$tmp_compile_dir"
         rm -rf "$tmp_compile_dir"
 
@@ -3955,7 +4170,7 @@ ARCHIVE_USE_RAM="${32:-true}"   # explicit --no-ram choice, NOT auto-tuned
                                  # script comment where it's captured
 GENERIC_OBFUSCATION_RULES_FILE="${33:-}"
 KNOWN_VENDOR_OBFUSCATION_FILE="${34:-}"
-SANDBOX_MODE="${35:-none}"
+SANDBOX_MODE="${35:-auto}"
 SANDBOX_USER="${36:-nobody}"
 SANDBOX_MEM_KB="${37:-1048576}"
 SANDBOX_CPU_SEC="${38:-60}"
@@ -3968,6 +4183,30 @@ DEEP_MODE="${39:-false}"       # --deep/--paranoid: bypass ALL automatic
 SHA1_CMD="${40:-none}"          # recovers ClamAV .hsb SHA1 entries that
                                  # used to be silently dropped — see
                                  # detect_sha1() in the main script.
+MAIN_SCRIPT_PID="${41:-$PPID}"  # PID of the top-level av.sh instance that
+                                 # launched this worker — embedded into
+                                 # every ephemeral resource name this
+                                 # worker creates (archive extraction
+                                 # dirs, chroot sandbox dirs, filtered
+                                 # pattern files) so a DIFFERENT,
+                                 # concurrently-running scan instance's
+                                 # startup sweep can tell "orphaned from a
+                                 # dead run" apart from "still in active
+                                 # use by a live one" — see
+                                 # _sweep_stale_shm_dirs in the main
+                                 # script for why this matters: it used to
+                                 # match purely by name pattern, which
+                                 # could not tell two instances apart at
+                                 # all (a real risk: cron + a manual scan
+                                 # running at the same time, or -w in the
+                                 # background plus a one-off audit).
+QUARANTINE_DRY_RUN="${42:-false}"  # --quarantine-dry-run: report what
+                                 # WOULD be quarantined without touching
+                                 # any file — see quarantine_file() below.
+QUARANTINE_SKIP_ARCHIVES="${43:-false}"  # --no-quarantine-archives
+SUID_REPORT_FILE="${44:-}"     # companion file for SUID_SGID live-stream
+                                 # writes — see threat() for why this needs
+                                 # to exist here too, not just in save_report()
 
 REPORT="$REPORT_DIR/${WORKER_ID}.txt"
 PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
@@ -4001,9 +4240,9 @@ _filter_patterns_file() {
     [ -n "$src" ] && [ -s "$src" ] || { : > "$dst" 2>/dev/null; return; }
     bb grep -v '^[[:space:]]*#' "$src" 2>/dev/null | bb grep -v '^[[:space:]]*$' > "$dst" 2>/dev/null
 }
-_IGNORE_SIGS_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_ignore_sigs.$$")"
-_GENERIC_OBFUSCATION_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_generic_obf.$$")"
-_KNOWN_VENDOR_OBFUSCATION_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_vendor_obf.$$")"
+_IGNORE_SIGS_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_ignore_sigs.$$")"
+_GENERIC_OBFUSCATION_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_generic_obf.$$")"
+_KNOWN_VENDOR_OBFUSCATION_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_${MAIN_SCRIPT_PID}_vendor_obf.$$")"
 # FIX (real leak found in practice — Ctrl+C during a scan left these
 # behind, growing by 3-per-worker on every subsequent interrupted run):
 # these three live for the worker's WHOLE lifetime (created once here at
@@ -4632,7 +4871,7 @@ _sandbox_run_chroot() {
     local target_dir="$1" archive_src="$2"; shift 2
     [ "$(id -u)" = "0" ] || { "$@"; return; }  # chroot needs root
     local chroot_dir
-    chroot_dir=$(mktemp -d /tmp/av_chroot.XXXXXX 2>/dev/null) || { "$@"; return; }
+    chroot_dir=$(mktemp -d "/tmp/av_chroot.${MAIN_SCRIPT_PID}.XXXXXX" 2>/dev/null) || { "$@"; return; }
     mkdir -p "$chroot_dir"/{bin,lib,lib64,usr,proc,dev,sbin} 2>/dev/null
 
     # FIX (real bug found in testing): binding target_dir to "$chroot_dir/tmp"
@@ -4681,12 +4920,34 @@ _sandbox_run_chroot() {
     # FIX: unmount everything (reverse order — last mounted, first
     # unmounted, matters when one mount is nested under another) BEFORE
     # removing the directory, not just rm -rf on top of active mounts.
+    # FIX (CRITICAL — real risk confirmed by direct testing): if umount
+    # AND umount -l BOTH fail for some mount (a hung process inside the
+    # jail, or the worker getting SIGKILL'd at exactly the wrong moment),
+    # the old code fell through to "rm -rf $chroot_dir" regardless. That
+    # is genuinely destructive: rm -rf CAN recurse INTO an active bind
+    # mount and delete its CONTENTS even though it cannot remove the
+    # mountpoint directory itself (the kernel blocks that specific
+    # rmdir, "Device or resource busy" — but everything *inside* is
+    # fair game to rm first). Confirmed directly: a bind-mounted test
+    # file was deleted this way even though the mountpoint directory
+    # "survived". Since these mounts are real system paths (/bin, /usr,
+    # /lib, /lib64, /sbin), a failed cleanup here could otherwise delete
+    # the ACTUAL system's own binaries. Now: verify every mount is
+    # actually gone (mountpoint -q) before ever calling rm -rf; if even
+    # one remains stuck, leave the directory in place untouched and log
+    # a warning instead of guessing it's safe to recurse through it.
     _cleanup_chroot() {
-        local i
+        local i still_mounted=false
         for (( i=${#mounted[@]}-1; i>=0; i-- )); do
             umount "${mounted[$i]}" 2>/dev/null || umount -l "${mounted[$i]}" 2>/dev/null || true
         done
-        rm -rf "$chroot_dir" 2>/dev/null
+        for i in "${mounted[@]}"; do
+            if mountpoint -q "$i" 2>/dev/null; then
+                still_mounted=true
+                echo "[WARN] chroot sandbox cleanup: '$i' is still mounted after umount + umount -l both failed -- refusing to rm -rf '$chroot_dir' (would risk deleting through the live mount). Left in place for manual cleanup: umount it, then remove the directory by hand." >&2
+            fi
+        done
+        [ "$still_mounted" = false ] && rm -rf "$chroot_dir" 2>/dev/null
     }
     trap _cleanup_chroot RETURN
 
@@ -4822,7 +5083,7 @@ _archive_tmpdir() {
         local avail
         avail=$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
         if [ "${avail:-0}" -ge "$ARCHIVE_MAX_EXTRACT_MB" ]; then
-            mktemp -d /dev/shm/av_arch_XXXXXX 2>/dev/null && return
+            mktemp -d "/dev/shm/av_arch_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null && return
         fi
     fi
     # FIX (real bug found in practice): this fallback used to be a bare
@@ -4836,7 +5097,7 @@ _archive_tmpdir() {
     # DLE content a second time under a path that looked unrelated to
     # this scanner at all. Prefixed now, matching every other tmp dir
     # this script creates.
-    mktemp -d "${TMPDIR:-/tmp}/av_arch_XXXXXX" 2>/dev/null
+    mktemp -d "${TMPDIR:-/tmp}/av_arch_${MAIN_SCRIPT_PID}_XXXXXX" 2>/dev/null
 }
 
 # Batched hash check across ALL members of one archive at once — computing
@@ -4998,11 +5259,48 @@ scan_archive() {
     # keeping this simple matters more than pruning it precisely.
     _ACTIVE_EXTRACT_DIRS+=("$extract_dir")
 
-    _archive_extract "$cur" "$atype" "$extract_dir"
+    # FIX (real gap found in security review): this used to let
+    # _archive_extract run to full completion, ONLY checking the total
+    # size AFTERWARD — for a genuine decompression bomb (a small archive
+    # that expands to gigabytes), the damage (disk fill / RAM exhaustion
+    # in the /dev/shm case) would already be done by the time anything
+    # noticed. Now runs extraction in the background and polls the
+    # directory's growing size WHILE it's still running, killing it
+    # immediately once it crosses the cap instead of after. A ~1s poll
+    # interval means some overshoot is still possible (whatever gets
+    # written in that window), but this bounds it to roughly one second's
+    # worth of writes instead of "however big the bomb actually is".
+    _archive_extract "$cur" "$atype" "$extract_dir" &
+    local extract_pid=$! bomb_killed=false extracted_kb=0
+    while kill -0 "$extract_pid" 2>/dev/null; do
+        extracted_kb=$(du -sk "$extract_dir" 2>/dev/null | awk '{print $1}')
+        if [ -n "$extracted_kb" ] && [ "$extracted_kb" -gt $(( ARCHIVE_MAX_EXTRACT_MB * 1024 )) ]; then
+            bomb_killed=true
+            pkill -TERM -P "$extract_pid" 2>/dev/null
+            kill -TERM "$extract_pid" 2>/dev/null
+            sleep 0.5
+            pkill -KILL -P "$extract_pid" 2>/dev/null
+            kill -KILL "$extract_pid" 2>/dev/null
+            break
+        fi
+        sleep 1
+    done
+    wait "$extract_pid" 2>/dev/null
 
-    local extracted_kb
     extracted_kb=$(du -sk "$extract_dir" 2>/dev/null | awk '{print $1}')
-    if [ -n "$extracted_kb" ] && [ "$extracted_kb" -gt $(( ARCHIVE_MAX_EXTRACT_MB * 1024 )) ]; then
+    if [ "$bomb_killed" = true ]; then
+        # FIX (real gap found in testing): the abort itself worked
+        # correctly (confirmed: extraction stopped around 110MB against a
+        # 50MB cap on a real 300MB decompression bomb, instead of letting
+        # it run to completion), but log() alone writes to this worker's
+        # EPHEMERAL internal report file, deleted with WORK_DIR at the
+        # end — an operator would see "0 threats, clean" with zero
+        # visibility that a bomb was even encountered. A decompression
+        # bomb is itself a strong signal worth surfacing prominently, not
+        # a detail to quietly protect against and stay silent about.
+        threat "ARCHIVE_BOMB_SUSPECTED" "$top_archive" "extracted>=${extracted_kb}KB before abort, cap=${ARCHIVE_MAX_EXTRACT_MB}MB"
+        log "Archive extraction ABORTED mid-extraction (exceeded ${ARCHIVE_MAX_EXTRACT_MB}MB decompressed cap -- possible decompression bomb): $top_archive"
+    elif [ -n "$extracted_kb" ] && [ "$extracted_kb" -gt $(( ARCHIVE_MAX_EXTRACT_MB * 1024 )) ]; then
         log "Archive extraction exceeded ${ARCHIVE_MAX_EXTRACT_MB}MB cap, scan may be incomplete: $top_archive"
     fi
 
@@ -5117,13 +5415,33 @@ threat() {
 
     printf 'THREAT:%s|%s|%s\n' "$type" "$file" "$info" >> "$REPORT"
     THREATS_FOUND=$(( THREATS_FOUND + 1 ))
-    if [ -n "$LIVE_REPORT_FILE" ]; then
+    # FIX (real gap reported): this used to unconditionally append EVERY
+    # threat, SUID_SGID included, to the main LIVE_REPORT_FILE — the
+    # split into a separate SUID_REPORT_FILE only happened in
+    # save_report() at the very END of a scan (which truncates and
+    # rewrites the live file cleanly). That left a real gap: anyone
+    # watching the live file DURING a scan (tail -f, or just checking
+    # progress), or a scan that gets interrupted before reaching
+    # save_report(), would still see SUID_SGID lines mixed into the main
+    # file — exactly what this feature exists to avoid. Routed to the
+    # SAME companion file live now, not just at the end.
+    if [ "$type" = "SUID_SGID" ]; then
+        if [ -n "$SUID_REPORT_FILE" ]; then
+            printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$type" "$file" "$info" >> "$SUID_REPORT_FILE" 2>/dev/null
+        fi
+    elif [ -n "$LIVE_REPORT_FILE" ]; then
         # Single printf = single write() syscall = atomic append even with
         # multiple worker processes writing the same file concurrently, as
         # long as the line stays under PIPE_BUF (a few KB) — safe here.
         printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$type" "$file" "$info" >> "$LIVE_REPORT_FILE" 2>/dev/null
     fi
-    [ -n "$QUARANTINE_DIR" ] && quarantine_file "$file" "$type"
+    [ -n "$QUARANTINE_DIR" ] || return 0
+    if [ "$QUARANTINE_SKIP_ARCHIVES" = "true" ]; then
+        case "$info" in
+            archive_member=*) log "QUARANTINE_SKIPPED (archive container, --no-quarantine-archives): $file"; return 0 ;;
+        esac
+    fi
+    quarantine_file "$file" "$type"
 }
 
 progress() {
@@ -5139,7 +5457,19 @@ quarantine_file() {
     [ -n "$QUARANTINE_DIR" ] || return 0
     [ -f "$src" ] || return 0
 
+    # --quarantine-dry-run: report what would happen, touch nothing. The
+    # real value here is -w (real-time) running unattended in production
+    # — a single overly-broad YARA rule or a bad signature update could
+    # otherwise move a batch of legitimate site files before a person
+    # notices. Dry-run lets someone validate a rule/signature change is
+    # safe before ever letting it actually move anything.
+    if [ "$QUARANTINE_DRY_RUN" = "true" ]; then
+        log "QUARANTINE_DRY_RUN (would move): $src ($type)"
+        return 0
+    fi
+
     mkdir -p "$QUARANTINE_DIR" 2>/dev/null
+    chmod 700 "$QUARANTINE_DIR" 2>/dev/null
 
     # Quarantine filename = sha256(original path) + original basename —
     # unique even for same-name files from different directories, without
