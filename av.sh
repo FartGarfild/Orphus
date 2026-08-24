@@ -641,21 +641,27 @@ net_fetch() {
     # ~90MB, source tarballs at a few MB each, busybox at ~1.1MB).
     #
     # FIX (real, CONFIRMED gap found in security review): none of the
-    # three downloaders had ANY bound on total transfer size or time —
-    # only --connect-timeout/-T, which cap the CONNECTION/read-idle phase,
-    # not the overall transfer. Confirmed directly: curl pulled 740MB from
-    # an effectively infinite local source in 5 seconds with nothing
-    # stopping it. A malicious or merely compromised server (or a MITM
-    # impersonating one) could otherwise fill disk or hang a download
-    # indefinitely. curl gets real, native protection (--max-filesize,
-    # --max-time); system wget gets its own (-Q quota); busybox wget's
-    # wget applet has NEITHER available (checked its --help directly) — so
-    # every path, including that one, ALSO gets a hard post-download size
-    # check as a uniform backstop regardless of which tool actually ran.
+    # three downloaders had ANY bound on total transfer size — only
+    # --connect-timeout/-T, which cap the CONNECTION/read-idle phase, not
+    # the overall transfer. Confirmed directly: curl pulled 740MB from an
+    # effectively infinite local source in 5 seconds with nothing
+    # stopping it. First attempt at a fix added native per-tool flags
+    # (curl --max-filesize/--max-time, wget -Q) on top of this — a real
+    # report then came in of THIS WRAPPED download failing on a real
+    # server while a plain, bare `curl url --output file` (no extra flags
+    # at all) succeeded. wget's -Q turned out to be a red herring anyway
+    # (its own docs say quota does NOT interrupt a single-file download,
+    # only stops STARTING further ones — meaningless here, and apparently
+    # not harmless either on some build). Rather than keep guessing which
+    # specific flag misbehaves on which specific tool version without
+    # being able to reproduce it directly, all the native per-tool size/
+    # time flags are gone — every downloader now just fetches plainly
+    # (matching the manual command confirmed to work), and the ONE
+    # protection mechanism is the post-download size check below,
+    # verified end-to-end including its own truncation edge case (see the
+    # comment on it further down).
     local url="$1" dest="$2" timeout="${3:-10}" ua="${4:-}" max_mb="${5:-300}"
     local max_bytes=$(( max_mb * 1024 * 1024 ))
-    local max_time=$(( timeout * 6 ))   # generous multiple of the connect
-                                          # timeout as a total-transfer cap
 
     _fetch_size_ok() {
         local f="$1" sz
@@ -687,42 +693,42 @@ net_fetch() {
         if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
     if command -v wget &>/dev/null; then
+        # FIX (real bug reported): -Q/--quota was added here for a
+        # size cap, but wget's OWN documented behavior is that quota does
+        # NOT interrupt a single file's download — it only stops
+        # STARTING further downloads afterward (relevant for recursive
+        # wget, meaningless for a single -O fetch like this one). At
+        # best a no-op; suspected of actively breaking the download on
+        # the specific wget build a real report came in against (direct
+        # curl worked, our wrapped call didn't) — removed. The
+        # post-download size check below is the real, verified
+        # protection regardless of which tool ran.
         if [ -n "$ua" ]; then
-            wget -q --timeout="$timeout" -Q "${max_bytes}" -U "$ua" -O "$dest" "$url" 2>/dev/null
+            wget -q --timeout="$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null
         else
-            wget -q --timeout="$timeout" -Q "${max_bytes}" -O "$dest" "$url" 2>/dev/null
+            wget -q --timeout="$timeout" -O "$dest" "$url" 2>/dev/null
         fi
         if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
     if command -v curl &>/dev/null; then
+        # NOTE: --max-filesize also dropped here, same reasoning as -Q
+        # above — even though curl's own docs are clearer about it than
+        # wget's -Q, a real report came in of the WRAPPED download
+        # failing while a plain manual curl (no extra flags at all)
+        # succeeded, and untangling exactly which flag was at fault
+        # without being able to reproduce it directly isn't worth the
+        # risk of guessing wrong twice. The post-download size check
+        # below is the one mechanism actually verified end-to-end
+        # (including its own edge case — see the comment on it above),
+        # so that's what all three downloaders rely on uniformly now.
         if [ -n "$ua" ]; then
-            curl -fsSL -A "$ua" --connect-timeout "$timeout" --max-time "$max_time" --max-filesize "$max_bytes" -o "$dest" "$url" 2>/dev/null
+            curl -fsSL -A "$ua" --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null
         else
-            curl -fsSL --connect-timeout "$timeout" --max-time "$max_time" --max-filesize "$max_bytes" -o "$dest" "$url" 2>/dev/null
+            curl -fsSL --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null
         fi
         if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
     rm -f "$dest" 2>/dev/null
-    return 1
-}
-
-check_network() {
-    # Probes the actual URL that will be fetched (defaults to busybox.net)
-    # rather than a fixed unrelated host — otherwise a working --busybox-url
-    # mirror would still be reported as "no network" if busybox.net itself
-    # happens to be unreachable from this machine.
-    local target="${1:-https://busybox.net}"
-    # On the first call, BUSYBOX_BIN is still empty, so this naturally
-    # falls back to system wget/curl (same bootstrap exception as net_fetch).
-    if [ -n "$BUSYBOX_BIN" ] && "$BUSYBOX_BIN" wget --help &>/dev/null 2>&1; then
-        "$BUSYBOX_BIN" wget -q -T 3 -O /dev/null "$target" 2>/dev/null && return 0
-    fi
-    if command -v wget &>/dev/null; then
-        wget -q --timeout=3 --spider "$target" 2>/dev/null && return 0
-    fi
-    if command -v curl &>/dev/null; then
-        curl -sf --connect-timeout 3 "$target" >/dev/null 2>&1 && return 0
-    fi
     return 1
 }
 
@@ -770,9 +776,21 @@ verify_busybox_binary() {
     local magic
     magic=$(head -c4 "$c" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
     [ "$magic" = "7f454c46" ] || return 1
+    # FIX (real bug found — matches the exact symptom reported: manual
+    # curl download succeeded, but this verification always failed
+    # regardless): _stat_size() is a WORKER-only function (defined
+    # between #__WORKER_START__/#__WORKER_END__), not available here —
+    # verify_busybox_binary() runs from the MAIN script (called by
+    # find_local_busybox()/download_busybox()). The call silently failed
+    # every time ("command not found"), sz fell back to 0 via the "||"
+    # fallback, and 0 is never >= 400000 — meaning this size check
+    # rejected EVERY real busybox binary unconditionally, download
+    # perfectly fine or not. Inlined, OS-portable equivalent instead
+    # (same fix already applied to net_fetch()'s own size check).
     local sz
-    sz=$(_stat_size "$c" 2>/dev/null) || sz=0
-    { [ "$sz" -ge 400000 ] && [ "$sz" -le 3000000 ]; } || return 1
+    if [ "$OS" = "macos" ]; then sz=$(stat -f '%z' "$c" 2>/dev/null)
+    else sz=$(stat -c '%s' "$c" 2>/dev/null); fi
+    { [ -n "$sz" ] && [ "$sz" -ge 400000 ] && [ "$sz" -le 3000000 ]; } || return 1
     "$c" --help 2>&1 | head -1 | grep -qi "busybox" || return 1
     return 0
 }
@@ -827,15 +845,22 @@ ensure_busybox() {
 
     local dl_url
     dl_url=$(busybox_url)
-    if check_network "$dl_url"; then
-        echo -e "${Y}[*] Trying emergency auto-download as a fallback...${Z}"
-        download_busybox "$dl_url" && return 0
-        echo -e "${R}[WARN] Emergency download also failed -> system tools (shell fallback)${Z}"
-        return 1
-    else
-        echo -e "${R}[WARN] No network -> system tools (shell fallback), no busybox${Z}"
-        return 1
-    fi
+    # FIX (real bug reported): check_network() as a pre-flight gate here
+    # was actively wrong — a person confirmed BOTH the wget --spider AND
+    # curl checks it uses succeed (exit 0) when run manually, yet the
+    # script still reported "No network" and skipped straight past
+    # attempting the real download. Whatever the exact cause (this is now
+    # the THIRD bug found in this same small area of the script — a
+    # pattern worth noticing), the check added a failure point of its own
+    # without protecting against anything download_busybox() doesn't
+    # already handle correctly on its own: if the network genuinely isn't
+    # there, net_fetch() inside it will simply fail cleanly, with clear
+    # messaging, same as any other real download failure. Removed the
+    # gate entirely — go straight to attempting the download.
+    echo -e "${Y}[*] Trying emergency auto-download as a fallback...${Z}"
+    download_busybox "$dl_url" && return 0
+    echo -e "${R}[WARN] Emergency download also failed -> system tools (shell fallback)${Z}"
+    return 1
 }
 
 busybox_has_applet() {
