@@ -20,3 +20,5 @@ pattern=/bin/sh -i.*nc_openbsd\.1\.gz$
 rule=EXT_WEBSHELL_PHP_Generic.*/vendor/matomo/device-detector/README\.md
 rule=WEBSHELL_PHP_Dynamic_Big.*/extension/csvprice_pro/app_order\.php
 rule=apt_CN_Tetrisplugins_JS.*/revslider/admin/includes/shortcode_generator/gutenberg/dist/blocks\.build\.js
+rule=EXT_WEBSHELL_PHP_Generic.*/mmtrade/filemanager/elFinderConnector\.class\.php
+rule=WEBSHELL_PHP_Generic_Callback.*/mmtrade/filemanager/elFinderConnector\.class\.php
