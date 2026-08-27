@@ -1,0 +1,21 @@
+# Oprhus AV Scanner — ignore_sigs
+#
+# One extended-regex (ERE) pattern per line, matched against
+# "TYPE|info" of each detection (e.g. "YARA_MATCH|rule=WEBSHELL_PHP_Dynamic_Big"
+# or "SIG_STRING_MATCH|pattern=chmod 777"). A match SUPPRESSES that
+# detection entirely — no log entry, no quarantine. Patterns match as
+# substrings, so "WEBSHELL_PHP_Dynamic_Big" also matches
+# "WEBSHELL_PHP_Dynamic_Big_v2" — anchor with ^/$ for an exact match.
+#
+# Use this for signatures/rules that are individually too broad for your
+# specific software (e.g. a CMS that ships obfuscated/encoded core files
+# for license protection — generic webshell-obfuscation heuristics can't
+# tell that apart from an actual backdoor by pattern alone).
+#
+# Examples (uncomment to use):
+# rule=WEBSHELL_PHP_Dynamic_Big
+# rule=WEBSHELL_PHP_Encoded_Big
+pattern=/bin/sh -i.*/sbin/chroot$
+pattern=/bin/sh -i.*nc_openbsd\.1\.gz$
+rule=EXT_WEBSHELL_PHP_Generic.*/vendor/matomo/device-detector/README\.md
+rule=WEBSHELL_PHP_Dynamic_Big.*/extension/csvprice_pro/app_order\.php
