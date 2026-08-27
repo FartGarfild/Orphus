@@ -19,3 +19,4 @@ pattern=/bin/sh -i.*/sbin/chroot$
 pattern=/bin/sh -i.*nc_openbsd\.1\.gz$
 rule=EXT_WEBSHELL_PHP_Generic.*/vendor/matomo/device-detector/README\.md
 rule=WEBSHELL_PHP_Dynamic_Big.*/extension/csvprice_pro/app_order\.php
+rule=apt_CN_Tetrisplugins_JS.*/revslider/admin/includes/shortcode_generator/gutenberg/dist/blocks\.build\.js
