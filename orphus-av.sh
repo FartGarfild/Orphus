@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Oprhus AV Scanner Unified (modular + quarantine + real-time + busybox-first)
+# Orphus AV Scanner Unified (modular + quarantine + real-time + busybox-first)
 # Features:
 #   - Built-in signature updater (Maldet, ClamAV, YARA, MalwareBazaar, custom)
 #   - Parallel workers with batch hashing (SHA256 + MD5) and YARA batching
@@ -309,7 +309,7 @@ export LC_ALL=C
 # 1. GLOBALS — all script variables defined once here, before any code uses
 #    them. init_*/detect_* functions and parse_args() fill in real values.
 # ============================================================================
-VERSION="0.3"
+VERSION="0.3.1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Re-exec into our OWN bundled bash (see build_bash_from_source /
