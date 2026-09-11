@@ -24,3 +24,4 @@ rule=EXT_WEBSHELL_PHP_Generic.*/mmtrade/filemanager/elFinderConnector\.class\.ph
 rule=WEBSHELL_PHP_Generic_Callback.*/mmtrade/filemanager/elFinderConnector\.class\.php
 rule=WEBSHELL_PHP_Dynamic_Big.*/vendor/clue/stream-filter/tests/FunTest\.php
 rule=WEBSHELL_PHP_OBFUSC_3.*/vendor/laravel/framework/src/Illuminate/Cache/PhpRedisLock\.php
+rule=WEBSHELL_PHP_Dynamic_Big.*vendor/spatie/laravel-ignition/src/Recorders/DumpRecorder/MultiDumpHandler\.php$
