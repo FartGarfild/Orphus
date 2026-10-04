@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Oprhus AV Scanner Unified (modular + quarantine + real-time + busybox-first)
+# Orphus AV Scanner Unified (modular + quarantine + real-time + busybox-first)
 # Features:
 #   - Built-in signature updater (Maldet, ClamAV, YARA, MalwareBazaar, custom)
 #   - Parallel workers with batch hashing (SHA256 + MD5) and YARA batching
@@ -23,7 +23,14 @@
 #
 # Options:
 #   -u, --update            Update signatures and EXIT (no auto-scan after)
-#   -r, --max-ram MB        Max RAM limit in megabytes (default: 500)
+#   -r, --max-ram MB        Max RAM limit in megabytes (default: 500). Enforced:
+#                            at start the worker count is cut to what fits; at
+#                            runtime, from 90% of the ceiling new yara starts
+#                            are held back, and if memory stays over it the
+#                            biggest yara is killed (its batch is rescanned per
+#                            file; a file that can't fit is reported as
+#                            SCAN_ABORTED, never counted as clean). Measured as
+#                            processes' anonymous memory + /dev/shm usage.
 #   -j, --workers N         Number of parallel worker processes (default: auto)
 #   -d, --dir PATH          Target directory to scan (default: /mnt)
 #   -s, --sigs PATH         Signature directory (default: ./signatures)
@@ -46,6 +53,37 @@
 #                            per line, matched against "TYPE|info" of each
 #                            detection. Default: signatures/ignore_sigs
 #                            (auto-created with a commented template).
+#   signatures/yara_exclude   (optional file, no flag) YARA rule FILES to
+#                            leave out of compilation entirely, one name or
+#                            glob per line (# comments). Unlike ignore_sigs
+#                            this stops the rules from RUNNING at all — the
+#                            generic regex ones cost real CPU and RAM. A few
+#                            known-useless community files are excluded
+#                            built-in (see YARA_BUILTIN_EXCLUDE); changing
+#                            this file triggers a recompile on the next run.
+#   --yara-rules LIST        Which community YARA rule categories to compile
+#                            (comma-separated profiles/categories). Profiles:
+#                              all (default)      every category, incl. legacy;
+#                                                  only the known-useless files in
+#                                                  YARA_BUILTIN_EXCLUDE are left out
+#                              server             all minus legacy
+#                                                  (webshell+webapp+linux+exploit
+#                                                   +malware+generic+docs)
+#                              hosting            webshell+webapp+linux+exploit
+#                                                  — the light option for a plain
+#                                                  PHP/CMS server: far less RAM
+#                                                  and CPU per scan
+#                            Categories: webshell webapp linux exploit malware
+#                            generic docs legacy. Your own rule files (not from
+#                            the two community repos) are always loaded. RAM of
+#                            ONE yara process scales with the compiled set
+#                            (hosting is the smallest; RAM Guard sizes the
+#                            worker count from the real rules.yarc), so heavier
+#                            profiles need a higher --max-ram. Changing the
+#                            profile recompiles.
+#   --yara-all               Load EVERY rule file (= --yara-rules all) and also
+#                            bypass the built-in file exclusions, whatever the
+#                            RAM cost. Your own yara_exclude still applies.
 #   -X, --exclude PATH        Skip this file/directory entirely (repeat for
 #                            multiple: -X /path/one -X /path/two). The AV's
 #                            own install dir, signature dir, and quarantine
@@ -243,6 +281,15 @@
 #   --check-deps             Print bundled/system/missing status for
 #                            busybox and yara/yarac, then exit
 #   -h, --help               Show this help (also runs --check-deps)
+#   --debug                   Keep --setup's build/compile logs
+#                            (configure/make output for yara/grep/bash) in
+#                            /tmp even after a SUCCESSFUL build — off by
+#                            default, since a successful build has no use
+#                            for them and they'd otherwise just pile up in
+#                            /tmp forever across every --setup run. Failed
+#                            builds always keep their logs regardless,
+#                            debug or not — that's the one case they're
+#                            actually needed for.
 #
 # File layout:
 #   1. GLOBALS         — all script variables, defined once here
@@ -309,7 +356,7 @@ export LC_ALL=C
 # 1. GLOBALS — all script variables defined once here, before any code uses
 #    them. init_*/detect_* functions and parse_args() fill in real values.
 # ============================================================================
-VERSION="0.2"
+VERSION="0.3.2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Re-exec into our OWN bundled bash (see build_bash_from_source /
@@ -441,6 +488,16 @@ SANDBOX_USER="nobody"
 SANDBOX_MEM_KB=1048576  # 1GB, simple mode only
 SANDBOX_CPU_SEC=60
 YARA_TIMEOUT_SEC=30    # --yara-timeout: abort a yara call after this many
+YARA_RULES_SPEC="all"        # --yara-rules (default: everything; "hosting" is
+                        # the lighter opt-in): which community YARA rule
+                        # categories to compile (see _yara_category)
+YARA_ALL=false          # --yara-all: every category, built-in file
+                        # exclusions bypassed too — at real RAM cost
+YARA_CATS=""            # expanded category list, filled by
+                        # _yara_expand_profile
+YARA_TIMEOUT_SEC_EXPLICIT=""  # set to 1 if --yara-timeout was explicitly
+                        # passed — lets --deep raise the default without
+                        # overriding a person's own explicit choice
                         # seconds (yara's own -a flag) — a real scan can
                         # otherwise hang indefinitely on a pathological
                         # file/rule combination (reported in practice: a
@@ -472,6 +529,12 @@ ARCHIVE_RAM_MAX_MB=50   # extract archives up to this COMPRESSED size
 ARCHIVE_MAX_DEPTH=2     # how many nested-archive levels to recurse into
 ARCHIVE_MAX_FILES=2000  # only scan the first N files inside one archive
 DO_SETUP=false         # --setup: build yara/yarac (and fetch busybox) then exit
+DEBUG_MODE=false       # --debug: keep build/compile logs (yara/grep/bash
+                        # setup) in /tmp even on SUCCESS, for inspection.
+                        # Default is to delete them once a build succeeds
+                        # — they only exist to help diagnose a FAILED
+                        # build, and otherwise just accumulate in /tmp on
+                        # every --setup run, forever, for no reason.
 SETUP_FORCE=false       # --setup --force: rebuild even if already present
 SETUP_COMPILE_ONLY=false # --setup --compile: skip --yara-url, always compile
 DO_CHECK_DEPS=false     # --check-deps: print dependency status and exit
@@ -641,21 +704,27 @@ net_fetch() {
     # ~90MB, source tarballs at a few MB each, busybox at ~1.1MB).
     #
     # FIX (real, CONFIRMED gap found in security review): none of the
-    # three downloaders had ANY bound on total transfer size or time —
-    # only --connect-timeout/-T, which cap the CONNECTION/read-idle phase,
-    # not the overall transfer. Confirmed directly: curl pulled 740MB from
-    # an effectively infinite local source in 5 seconds with nothing
-    # stopping it. A malicious or merely compromised server (or a MITM
-    # impersonating one) could otherwise fill disk or hang a download
-    # indefinitely. curl gets real, native protection (--max-filesize,
-    # --max-time); system wget gets its own (-Q quota); busybox wget's
-    # wget applet has NEITHER available (checked its --help directly) — so
-    # every path, including that one, ALSO gets a hard post-download size
-    # check as a uniform backstop regardless of which tool actually ran.
+    # three downloaders had ANY bound on total transfer size — only
+    # --connect-timeout/-T, which cap the CONNECTION/read-idle phase, not
+    # the overall transfer. Confirmed directly: curl pulled 740MB from an
+    # effectively infinite local source in 5 seconds with nothing
+    # stopping it. First attempt at a fix added native per-tool flags
+    # (curl --max-filesize/--max-time, wget -Q) on top of this — a real
+    # report then came in of THIS WRAPPED download failing on a real
+    # server while a plain, bare `curl url --output file` (no extra flags
+    # at all) succeeded. wget's -Q turned out to be a red herring anyway
+    # (its own docs say quota does NOT interrupt a single-file download,
+    # only stops STARTING further ones — meaningless here, and apparently
+    # not harmless either on some build). Rather than keep guessing which
+    # specific flag misbehaves on which specific tool version without
+    # being able to reproduce it directly, all the native per-tool size/
+    # time flags are gone — every downloader now just fetches plainly
+    # (matching the manual command confirmed to work), and the ONE
+    # protection mechanism is the post-download size check below,
+    # verified end-to-end including its own truncation edge case (see the
+    # comment on it further down).
     local url="$1" dest="$2" timeout="${3:-10}" ua="${4:-}" max_mb="${5:-300}"
     local max_bytes=$(( max_mb * 1024 * 1024 ))
-    local max_time=$(( timeout * 6 ))   # generous multiple of the connect
-                                          # timeout as a total-transfer cap
 
     _fetch_size_ok() {
         local f="$1" sz
@@ -687,42 +756,42 @@ net_fetch() {
         if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
     if command -v wget &>/dev/null; then
+        # FIX (real bug reported): -Q/--quota was added here for a
+        # size cap, but wget's OWN documented behavior is that quota does
+        # NOT interrupt a single file's download — it only stops
+        # STARTING further downloads afterward (relevant for recursive
+        # wget, meaningless for a single -O fetch like this one). At
+        # best a no-op; suspected of actively breaking the download on
+        # the specific wget build a real report came in against (direct
+        # curl worked, our wrapped call didn't) — removed. The
+        # post-download size check below is the real, verified
+        # protection regardless of which tool ran.
         if [ -n "$ua" ]; then
-            wget -q --timeout="$timeout" -Q "${max_bytes}" -U "$ua" -O "$dest" "$url" 2>/dev/null
+            wget -q --timeout="$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null
         else
-            wget -q --timeout="$timeout" -Q "${max_bytes}" -O "$dest" "$url" 2>/dev/null
+            wget -q --timeout="$timeout" -O "$dest" "$url" 2>/dev/null
         fi
         if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
     if command -v curl &>/dev/null; then
+        # NOTE: --max-filesize also dropped here, same reasoning as -Q
+        # above — even though curl's own docs are clearer about it than
+        # wget's -Q, a real report came in of the WRAPPED download
+        # failing while a plain manual curl (no extra flags at all)
+        # succeeded, and untangling exactly which flag was at fault
+        # without being able to reproduce it directly isn't worth the
+        # risk of guessing wrong twice. The post-download size check
+        # below is the one mechanism actually verified end-to-end
+        # (including its own edge case — see the comment on it above),
+        # so that's what all three downloaders rely on uniformly now.
         if [ -n "$ua" ]; then
-            curl -fsSL -A "$ua" --connect-timeout "$timeout" --max-time "$max_time" --max-filesize "$max_bytes" -o "$dest" "$url" 2>/dev/null
+            curl -fsSL -A "$ua" --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null
         else
-            curl -fsSL --connect-timeout "$timeout" --max-time "$max_time" --max-filesize "$max_bytes" -o "$dest" "$url" 2>/dev/null
+            curl -fsSL --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null
         fi
         if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
     rm -f "$dest" 2>/dev/null
-    return 1
-}
-
-check_network() {
-    # Probes the actual URL that will be fetched (defaults to busybox.net)
-    # rather than a fixed unrelated host — otherwise a working --busybox-url
-    # mirror would still be reported as "no network" if busybox.net itself
-    # happens to be unreachable from this machine.
-    local target="${1:-https://busybox.net}"
-    # On the first call, BUSYBOX_BIN is still empty, so this naturally
-    # falls back to system wget/curl (same bootstrap exception as net_fetch).
-    if [ -n "$BUSYBOX_BIN" ] && "$BUSYBOX_BIN" wget --help &>/dev/null 2>&1; then
-        "$BUSYBOX_BIN" wget -q -T 3 -O /dev/null "$target" 2>/dev/null && return 0
-    fi
-    if command -v wget &>/dev/null; then
-        wget -q --timeout=3 --spider "$target" 2>/dev/null && return 0
-    fi
-    if command -v curl &>/dev/null; then
-        curl -sf --connect-timeout 3 "$target" >/dev/null 2>&1 && return 0
-    fi
     return 1
 }
 
@@ -770,9 +839,21 @@ verify_busybox_binary() {
     local magic
     magic=$(head -c4 "$c" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
     [ "$magic" = "7f454c46" ] || return 1
+    # FIX (real bug found — matches the exact symptom reported: manual
+    # curl download succeeded, but this verification always failed
+    # regardless): _stat_size() is a WORKER-only function (defined
+    # between #__WORKER_START__/#__WORKER_END__), not available here —
+    # verify_busybox_binary() runs from the MAIN script (called by
+    # find_local_busybox()/download_busybox()). The call silently failed
+    # every time ("command not found"), sz fell back to 0 via the "||"
+    # fallback, and 0 is never >= 400000 — meaning this size check
+    # rejected EVERY real busybox binary unconditionally, download
+    # perfectly fine or not. Inlined, OS-portable equivalent instead
+    # (same fix already applied to net_fetch()'s own size check).
     local sz
-    sz=$(_stat_size "$c" 2>/dev/null) || sz=0
-    { [ "$sz" -ge 400000 ] && [ "$sz" -le 3000000 ]; } || return 1
+    if [ "$OS" = "macos" ]; then sz=$(stat -f '%z' "$c" 2>/dev/null)
+    else sz=$(stat -c '%s' "$c" 2>/dev/null); fi
+    { [ -n "$sz" ] && [ "$sz" -ge 400000 ] && [ "$sz" -le 3000000 ]; } || return 1
     "$c" --help 2>&1 | head -1 | grep -qi "busybox" || return 1
     return 0
 }
@@ -785,10 +866,26 @@ find_local_busybox() {
 
     local c
     for c in "${candidates[@]}"; do
-        if verify_busybox_binary "$c"; then
-            BUSYBOX_BIN="$c"
-            return 0
-        fi
+        # FIX (real, reproducible-enough report): verify_busybox_binary()
+        # failed on a file confirmed byte-for-byte unchanged from a known-
+        # good copy — right after Ctrl+C'ing a PREVIOUS av.sh invocation
+        # moments earlier. No direct code path was found connecting the
+        # two (cleanup() only ever touches /tmp and /dev/shm, never
+        # SCRIPT_DIR/bin), so the exact mechanism is unconfirmed — quite
+        # possibly some transient process-group/session quirk in that
+        # specific rescue environment right after a SIGINT, since
+        # verify_busybox_binary's last check actually EXECUTES the file
+        # (`"$c" --help`), unlike the earlier magic-byte/size checks which
+        # only read it. Rather than guess further, this retries a couple
+        # of times with a brief pause before concluding "genuinely not
+        # there" — cheap insurance against a transient hiccup, regardless
+        # of whatever the underlying cause turns out to be; a truly
+        # missing/corrupt file will still consistently fail all attempts.
+        local attempt
+        for attempt in 1 2 3; do
+            verify_busybox_binary "$c" && { BUSYBOX_BIN="$c"; return 0; }
+            [ "$attempt" -lt 3 ] && sleep 0.3
+        done
     done
     return 1
 }
@@ -827,15 +924,22 @@ ensure_busybox() {
 
     local dl_url
     dl_url=$(busybox_url)
-    if check_network "$dl_url"; then
-        echo -e "${Y}[*] Trying emergency auto-download as a fallback...${Z}"
-        download_busybox "$dl_url" && return 0
-        echo -e "${R}[WARN] Emergency download also failed -> system tools (shell fallback)${Z}"
-        return 1
-    else
-        echo -e "${R}[WARN] No network -> system tools (shell fallback), no busybox${Z}"
-        return 1
-    fi
+    # FIX (real bug reported): check_network() as a pre-flight gate here
+    # was actively wrong — a person confirmed BOTH the wget --spider AND
+    # curl checks it uses succeed (exit 0) when run manually, yet the
+    # script still reported "No network" and skipped straight past
+    # attempting the real download. Whatever the exact cause (this is now
+    # the THIRD bug found in this same small area of the script — a
+    # pattern worth noticing), the check added a failure point of its own
+    # without protecting against anything download_busybox() doesn't
+    # already handle correctly on its own: if the network genuinely isn't
+    # there, net_fetch() inside it will simply fail cleanly, with clear
+    # messaging, same as any other real download failure. Removed the
+    # gate entirely — go straight to attempting the download.
+    echo -e "${Y}[*] Trying emergency auto-download as a fallback...${Z}"
+    download_busybox "$dl_url" && return 0
+    echo -e "${R}[WARN] Emergency download also failed -> system tools (shell fallback)${Z}"
+    return 1
 }
 
 busybox_has_applet() {
@@ -1163,6 +1267,7 @@ build_yara_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    [ "$DEBUG_MODE" = true ] || rm -f /tmp/av_yara_setup_configure.log /tmp/av_yara_setup_make.log 2>/dev/null
 
     mkdir -p "$SCRIPT_DIR/bin"
     cp "$workdir/yara-${version}/yara" "$workdir/yara-${version}/yarac" "$SCRIPT_DIR/bin/"
@@ -1246,6 +1351,7 @@ build_grep_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    [ "$DEBUG_MODE" = true ] || rm -f /tmp/av_grep_setup_configure.log /tmp/av_grep_setup_make.log 2>/dev/null
 
     mkdir -p "$SCRIPT_DIR/bin"
     cp "$workdir/grep-${version}/src/grep" "$SCRIPT_DIR/bin/grep"
@@ -1332,6 +1438,7 @@ build_bash_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    [ "$DEBUG_MODE" = true ] || rm -f /tmp/av_bash_setup_configure.log /tmp/av_bash_setup_make.log 2>/dev/null
 
     mkdir -p "$SCRIPT_DIR/bin"
     cp "$workdir/bash-${version}/bash" "$SCRIPT_DIR/bin/bash"
@@ -1399,8 +1506,26 @@ parse_args() {
             --archive-max-extract-mb) ARCHIVE_MAX_EXTRACT_MB="$2"; shift 2 ;;
             --archive-max-depth)      ARCHIVE_MAX_DEPTH="$2"; shift 2 ;;
             --archive-max-files)      ARCHIVE_MAX_FILES="$2"; shift 2 ;;
-            --yara-timeout)           YARA_TIMEOUT_SEC="$2"; shift 2 ;;
-            --sandbox-mode)  SANDBOX_MODE="$2"; shift 2 ;;
+            --yara-timeout)           YARA_TIMEOUT_SEC="$2"; YARA_TIMEOUT_SEC_EXPLICIT=1; shift 2 ;;
+            --yara-rules)             _yara_validate_spec "$2" || exit 1; YARA_RULES_SPEC="$2"; shift 2 ;;
+            --yara-all)               YARA_ALL=true; shift ;;
+            --sandbox-mode)
+                # FIX (real bug reported): "$2" used to be accepted
+                # unconditionally — a missing value (e.g. "--sandbox-mode
+                # -L", another flag immediately following with no actual
+                # mode given) silently swallowed THAT flag as if it were
+                # the mode string, corrupting SANDBOX_MODE to "-L" AND
+                # eating -L itself, with zero warning (an unrecognized
+                # mode falls through to "none" behavior silently rather
+                # than erroring). Now validated against the real option
+                # set right here, so a mistake like this is caught
+                # immediately and loudly instead of silently corrupting
+                # two flags at once.
+                case "$2" in
+                    auto|bwrap|unshare|chroot|simple|none) : ;;
+                    *) echo "[FAIL] --sandbox-mode requires one of: auto|bwrap|unshare|chroot|simple|none (got: '${2:-<missing>}')" >&2; exit 1 ;;
+                esac
+                SANDBOX_MODE="$2"; shift 2 ;;
             -P|--scan-processes) SCAN_PROCESSES=true; shift ;;
             -K|--check-kernel)   CHECK_KERNEL=true; shift ;;
             --offline-root)      OFFLINE_ROOT="$2"; shift 2 ;;
@@ -1415,6 +1540,19 @@ parse_args() {
                                  # Bumped unless the person ALSO passed an
                                  # explicit -m/--max-size of their own.
                                  [ -z "$MAX_SCAN_MB_EXPLICIT" ] && MAX_SCAN_MB=200
+                                 # Same gap, second instance (real bug
+                                 # reported: lots of files skipped as
+                                 # "took too long to scan" under --deep):
+                                 # raising MAX_SCAN_MB to 200 without ALSO
+                                 # raising the time budget means a large
+                                 # file --deep newly stops skipping on
+                                 # size still gets skipped on time instead
+                                 # — see _yara_bisect_slow_batch for the
+                                 # other half of this fix (its short
+                                 # per-file timeout is now proportional to
+                                 # this value, so raising it here actually
+                                 # helps there too).
+                                 [ -z "$YARA_TIMEOUT_SEC_EXPLICIT" ] && YARA_TIMEOUT_SEC=120
                                  shift ;;
             -L|--long-time)  LONG_TIME_MODE=true; shift ;;
             --long-time-threshold)    LONG_TIME_THRESHOLD_SEC="$2"; shift 2 ;;
@@ -1426,6 +1564,7 @@ parse_args() {
             --mb-key)        MB_KEY="$2"; shift 2 ;;
             -q|--quarantine) QUARANTINE_ENABLED=true; shift ;;
             --quarantine-dry-run) QUARANTINE_ENABLED=true; QUARANTINE_DRY_RUN=true; shift ;;
+            --debug)         DEBUG_MODE=true; shift ;;
             --no-quarantine-archives) QUARANTINE_SKIP_ARCHIVES=true; shift ;;
             --quarantine-dir)  QUARANTINE_ENABLED=true; QUARANTINE_DIR="$2"; shift 2 ;;
             --quarantine-perm) QUARANTINE_PERM="$2"; shift 2 ;;
@@ -1479,6 +1618,37 @@ apply_low_priority() {
     fi
 }
 
+# Caps WORKERS so that WORKERS x (RAM of one yara process) fits MAX_RAM_MB.
+# $1 = optional path of a compiled ruleset to size from.
+# One yara process holds the whole compiled set, so its RAM scales with it.
+# Measured with the real script (built-in file exclusions active), peak RSS of
+# one yara process loading the set: ~119MB for profile all (29MB rules.yarc),
+# ~101MB for server (21MB), ~14MB for hosting (4MB) -> about 3x the .yarc size
+# plus a constant; with a ClamAV-converted set (hex-only rules, ~2.3x) that
+# stays on the safe side. 120MB is kept as the floor: it also covers the
+# memory a worker spends while scanning big files.
+_yara_ram_cap() {
+    local yarc="$1" est=120 sz est2 max_safe
+    [ "$YARA_CMD" != "none" ] || return 0
+    [ -d "$SIGNATURES/yara" ] || { [ -n "$yarc" ] && [ -f "$yarc" ]; } || return 0
+    _yara_expand_profile
+    case " $YARA_CATS " in
+        *" legacy "*)  est=150 ;;
+        *" malware "*) est=130 ;;
+    esac
+    if [ -n "$yarc" ] && [ -f "$yarc" ]; then
+        sz=$(( $(wc -c < "$yarc" 2>/dev/null || echo 0) / 1048576 ))
+        est2=$(( sz * 3 + 40 ))
+        [ "$est2" -gt "$est" ] && est=$est2
+    fi
+    max_safe=$(( MAX_RAM_MB / est ))
+    [ "$max_safe" -lt 1 ] && max_safe=1
+    if [ "$WORKERS" -gt "$max_safe" ]; then
+        echo -e "${Y}[WARN] YARA RAM estimate (~${est} MB per yara process): reducing workers $WORKERS -> $max_safe${Z}"
+        WORKERS=$max_safe
+    fi
+}
+
 init_workers() {
     # WORKERS may be set via -j/--workers; otherwise auto by CPU count.
     [ -z "$WORKERS" ] && WORKERS=$(cpu_count)
@@ -1500,15 +1670,11 @@ init_workers() {
 
     echo -e "${B}[*] RAM Guard: ceiling ${C}${MAX_RAM_MB} MB${Z}"
 
-    if [ "$YARA_CMD" != "none" ] && [ -d "$SIGNATURES/yara" ]; then
-        local est_yara_mb=120
-        local max_safe=$(( MAX_RAM_MB / est_yara_mb ))
-        [ "$max_safe" -lt 1 ] && max_safe=1
-        if [ "$WORKERS" -gt "$max_safe" ]; then
-            echo -e "${Y}[WARN] YARA RAM estimate: reducing workers $WORKERS -> $max_safe${Z}"
-            WORKERS=$max_safe
-        fi
-    fi
+    # Early estimate: from the previous compile's cache if there is one, else
+    # from the profile table. Re-checked against the REAL compiled ruleset
+    # right after compile_signatures (see main) — that one includes the
+    # ClamAV-converted rules, which this early pass can't see on a first run.
+    _yara_ram_cap "$SIGNATURES/.cache/yara/rules.yarc"
 
     # Capture the person's ORIGINAL --no-ram preference for archive
     # extraction BEFORE the low-RAM-profile auto-tuning below can
@@ -1571,7 +1737,7 @@ init_ignore_sigs() {
     if [ ! -f "$IGNORE_SIGS_FILE" ]; then
         mkdir -p "$(dirname "$IGNORE_SIGS_FILE")" 2>/dev/null
         cat << 'EOF' > "$IGNORE_SIGS_FILE" 2>/dev/null
-# Oprhus AV Scanner — ignore_sigs
+# Orphus AV Scanner — ignore_sigs
 #
 # One extended-regex (ERE) pattern per line, matched against
 # "TYPE|info|FILEPATH" of each detection, e.g.:
@@ -1635,7 +1801,7 @@ init_vendor_obfuscation_allowlist() {
     if [ ! -f "$GENERIC_OBFUSCATION_RULES_FILE" ]; then
         mkdir -p "$(dirname "$GENERIC_OBFUSCATION_RULES_FILE")" 2>/dev/null
         cat << 'EOF' > "$GENERIC_OBFUSCATION_RULES_FILE" 2>/dev/null
-# Oprhus AV Scanner — generic_obfuscation_rules
+# Orphus AV Scanner — generic_obfuscation_rules
 #
 # One ERE pattern per line, matched against a YARA rule NAME. These are
 # rules broad/generic enough ("does this look obfuscated at all") that
@@ -1653,13 +1819,14 @@ init_vendor_obfuscation_allowlist() {
 ^WEBSHELL_PHP_OBFUSC_Fopo$
 ^WEBSHELL_PHP_Gzinflated$
 ^webshell_php_by_string_obfuscation$
+^apt_CN_Tetrisplugins_JS$
 EOF
     fi
 
     if [ ! -f "$KNOWN_VENDOR_OBFUSCATION_FILE" ]; then
         mkdir -p "$(dirname "$KNOWN_VENDOR_OBFUSCATION_FILE")" 2>/dev/null
         cat << 'EOF' > "$KNOWN_VENDOR_OBFUSCATION_FILE" 2>/dev/null
-# Oprhus AV Scanner — known_vendor_obfuscation
+# Orphus AV Scanner — known_vendor_obfuscation
 #
 # One ERE pattern per line — a distinctive fingerprint of a SPECIFIC,
 # LEGITIMATE vendor's own code-obfuscation scheme (usually license
@@ -1680,6 +1847,24 @@ EOF
 # heuristic never caught it either, for what it's worth). Distinctive
 # enough on its own without needing to also match the header line.
 strrev\('edoced_46esab'\)
+#
+# Standard Webpack (3.x-style) bundler bootstrap — confirmed on a real
+# revslider (Slider Revolution) Gutenberg block bundle that tripped
+# apt_CN_Tetrisplugins_JS: verified BOTH the file's own mtime (identical
+# to every sibling file in the same build output directory — consistent
+# with one normal deployment, not a separately-planted file) and its
+# actual content, which is textbook webpack module-wrapper code with
+# eval() used only for source-map support (//# sourceURL/
+# sourceMappingURL annotations) — none of the Tetris campaign's actual
+# distinguishing markers (a0_0x-style variable names, fromCharCode-based
+# string reconstruction) are present. Scoped ONLY to
+# apt_CN_Tetrisplugins_JS in generic_obfuscation_rules, not any of the
+# webshell rules — an attacker COULD in principle copy this exact
+# boilerplate line to wrap malicious code, but doing so gets them
+# nothing against the webshell-family rules, only this one narrower
+# APT-campaign rule, and genuine malicious payload content would still
+# need to pass every other signature/heuristic in the pipeline.
+return __webpack_require__\(__webpack_require__\.s = 0\);
 EOF
     fi
 }
@@ -1709,7 +1894,7 @@ init_live_report() {
     fi
 
     {
-        echo "# Oprhus AV Scanner — live threat log (updated as threats are found)"
+        echo "# Orphus AV Scanner — live threat log (updated as threats are found)"
         echo "# Target: $ROOT_DIR"
         echo "# Started: $(date 2>/dev/null || echo unknown)"
         echo "# If this scan gets interrupted, whatever is below this line is still valid."
@@ -1755,6 +1940,16 @@ update_signatures() {
     if head -c 11 /tmp/main.cvd | grep -q "ClamAV-VDB"; then
         dd if=/tmp/main.cvd  bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
         dd if=/tmp/daily.cvd bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
+        # FIX (real annoyance reported): files packed inside a .cvd's own
+        # internal tar stream carry epoch-zero (1970-01-01) mtimes — a
+        # property of ClamAV's own packaging, not something extraction
+        # itself warns about. Left as-is, this surfaces later as noisy
+        # "implausibly old time stamp" warnings the FIRST time anyone
+        # (a backup script, `tar -cvf` of the whole install dir, etc.)
+        # tries to archive these files again. Stamped to the current
+        # time right after extraction so that epoch timestamp never
+        # propagates downstream to any other tool.
+        find "$clam_dir" -exec touch {} + 2>/dev/null
         echo " ✓ ClamAV unpacked"
     else
         echo " ! ClamAV files are not valid CVD (probably Cloudflare block)"
@@ -1801,6 +1996,7 @@ update_signatures() {
         local yara_compiled="$yara_dir/rules.yarc"
         > "$yara_index"
         find "$yara_dir" -type f \( -name "*.yar" -o -name "*.yara" \) ! -name "index.yar" 2>/dev/null | while read -r yfile; do
+            _yara_file_excluded "$yfile" "$sig_dir/yara_exclude" && continue
             if yarac "$yfile" /dev/null &>/dev/null; then
                 echo "include \"$yfile\"" >> "$yara_index"
             fi
@@ -2043,6 +2239,199 @@ run_awk_parallel() {
     return 0
 }
 
+# YARA rule FILES that are excluded from compilation by default — whole
+# community-ruleset files confirmed (real scans, sample-checked) to hold
+# only generic indicators or Windows-only checks with no signal on a Linux
+# hosting server, while costing real CPU and RAM: generic regex rules were
+# measured ~20x slower than plain-string rules on a 150MB file, and on
+# text-heavy data kept hundreds of MB of match lists in memory. This is
+# separate from _is_builtin_noisy_rule(), which only hides their OUTPUT —
+# the rules still ran. Extend per-install with signatures/yara_exclude
+# (one file name or glob per line, # comments) without editing the script.
+#   antidebug_antivm.yar  65 Windows-PE anti-debug / anti-VM checks
+#   crypto_signatures.yar 124 "contains a standard algorithm constant table"
+#   domain.yar            1 rule, fires on any file mentioning a hostname
+#   RAT_Cerberus.yar      1 rule, matched libmagic's /etc/apache2/magic
+# NOTE: MALW_Miscelanea_Linux.yar is deliberately NOT here — 5 of its 7
+# rules are real Linux botnet/backdoor signatures (AES.DDoS, BillGates,
+# Elknot, MrBlack, Tsunami); its other 2 (rootkit, exploit) are already
+# silenced by _is_builtin_noisy_rule().
+YARA_BUILTIN_EXCLUDE="antidebug_antivm.yar crypto_signatures.yar domain.yar RAT_Cerberus.yar"
+
+# Which community-repo rule files belong to which CATEGORY. Only files from
+# the two repos `-u` clones (signature-base, Yara-Rules/rules) are
+# classified; anything else — your own rules, maldet's — returns "-" and is
+# ALWAYS kept. Categories, by what a file is FOR:
+#   webshell  *webshell* files, Yara-Rules/webshells/
+#   webapp    PHP/JS/CMS-specific (php, wordpress, joomla, skimmers, JS obfuscation)
+#   linux     Linux/ELF malware (linux, lnx, elf, mirai)
+#   exploit   exploit kits, CVE rules, expl_/exploit_/vul_/vuln_ files
+#   malware   named malware families, APT/crime/RAT/ransom sets — mostly Windows
+#   generic   gen_/generic_/susp_ heuristics — broad, FP-prone by design
+#   docs      malicious documents, e-mail/phishing
+#   legacy    crypto constants, anti-debug/VM, packers, utils, deprecated,
+#             vendor/tests — measured to be almost pure noise on a server
+#   index     *index.yar files that only #include others — always skipped
+# Profiles: all     = everything incl. legacy (default),
+#           server  = everything except legacy,
+#           hosting = webshell+webapp+linux+exploit (light, opt-in).
+_yara_category() {
+    local p b
+    p=$(printf '%s' "$1" | tr 'A-Z' 'a-z'); b=${p##*/}
+    case "$p" in
+        */signature-base/yara/*|*/signature-base/vendor/*|*/signature-base/tests/*|*/yara/rules/*) ;;
+        *) echo "-"; return ;;
+    esac
+    case "$b" in index.yar|*_index.yar) echo index; return ;; esac
+    case "$p" in
+        */signature-base/tests/*|*/signature-base/vendor/*|*/yara/rules/antidebug_antivm/*|*/yara/rules/capabilities/*|\
+        */yara/rules/crypto/*|*/yara/rules/packers/*|*/yara/rules/utils/*|*/yara/rules/deprecated/*|*/yara/rules/mobile_malware/*)
+            echo legacy; return ;;
+        */yara/rules/webshells/*) echo webshell; return ;;
+    esac
+    case "$b" in
+        *webshell*) echo webshell ;;
+        *linux*|*lnx*|*elf_*|*_elf*|*mirai*) echo linux ;;
+        *php*|*wordpress*|*joomla*|*drupal*|*magento*|*skimmer*|*magecart*|*javascript*|*obfuscatorio*|*_js_*|*_js.yar|js_*) echo webapp ;;
+        expl_*|exploit_*|vul_*|vuln_*) echo exploit ;;
+        *maldoc*|*phish*) echo docs ;;
+        *)
+            case "$p" in
+                */yara/rules/exploit_kits/*|*/yara/rules/cve_rules/*) echo exploit ;;
+                */yara/rules/maldocs/*|*/yara/rules/email/*)          echo docs ;;
+                */yara/rules/malware/*)                                echo malware ;;
+                *)  case "$b" in
+                        apt_*|crime_*|mal_*|hktl_*|spy_*|threat_*|pua_*|cn_*|seaspy_*) echo malware ;;
+                        *) echo generic ;;
+                    esac ;;
+            esac ;;
+    esac
+}
+
+# $1 = comma-separated list of categories/profiles; exits non-zero with a
+# message on anything unknown, so a typo can't silently load nothing.
+_yara_validate_spec() {
+    local tok
+    local -a toks
+    IFS=',' read -ra toks <<< "$1"
+    [ "${#toks[@]}" -eq 0 ] && { echo "[FAIL] --yara-rules needs a value" >&2; return 1; }
+    for tok in "${toks[@]}"; do
+        case "$tok" in
+            hosting|server|all|webshell|webapp|linux|exploit|malware|generic|docs|legacy) ;;
+            *) echo "[FAIL] --yara-rules: unknown category/profile '${tok:-<empty>}' (profiles: hosting|server|all; categories: webshell|webapp|linux|exploit|malware|generic|docs|legacy)" >&2
+               return 1 ;;
+        esac
+    done
+}
+
+# Expands YARA_RULES_SPEC (and --yara-all) into YARA_CATS, a space-separated set.
+_yara_expand_profile() {
+    local tok cats=""
+    local -a toks
+    IFS=',' read -ra toks <<< "$YARA_RULES_SPEC"
+    for tok in "${toks[@]}"; do
+        case "$tok" in
+            hosting) cats="$cats webshell webapp linux exploit" ;;
+            server)  cats="$cats webshell webapp linux exploit malware generic docs" ;;
+            all)     cats="$cats webshell webapp linux exploit malware generic docs legacy" ;;
+            *)       cats="$cats $tok" ;;
+        esac
+    done
+    [ "$YARA_ALL" = true ] && cats="webshell webapp linux exploit malware generic docs legacy"
+    YARA_CATS=$(printf '%s\n' $cats | sort -u | tr '\n' ' ')
+}
+
+# Part of the signature-cache key: switching profile must recompile.
+_yara_profile_key() {
+    [ -z "$YARA_CATS" ] && _yara_expand_profile
+    printf 'yara=%s;all=%s' "$(printf '%s' "$YARA_CATS" | sed 's/ *$//; s/ /,/g')" "$YARA_ALL"
+}
+
+# $1 = bare file name, $2 = optional path to the per-install exclude list.
+_yara_name_excluded() {
+    local base="$1" list="$2" pat
+    if [ "$YARA_ALL" != true ]; then
+        case " $YARA_BUILTIN_EXCLUDE " in *" $base "*) return 0 ;; esac
+    fi
+    if [ -n "$list" ] && [ -f "$list" ]; then
+        while IFS= read -r pat; do
+            case "$pat" in ''|'#'*) continue ;; esac
+            case "$base" in $pat) return 0 ;; esac
+        done < "$list"
+    fi
+    return 1
+}
+
+# $1 = path of a candidate .yar/.yara file, $2 = optional exclude-list path.
+# True if the file should NOT be compiled: it's an index, its category isn't
+# selected, its name is excluded, or it is an index-like file that INCLUDEs
+# an excluded one (the index `-u` builds uses absolute include paths and
+# would pull excluded rules straight back in).
+_yara_file_excluded() {
+    local f="$1" list="$2" cat inc
+    [ -z "$YARA_CATS" ] && _yara_expand_profile
+    case "${f##*/}" in index.yar|*_index.yar) return 0 ;; esac
+    cat=$(_yara_category "$f")
+    if [ "$cat" != "-" ]; then
+        case " $YARA_CATS " in *" $cat "*) ;; *) return 0 ;; esac
+    fi
+    _yara_name_excluded "${f##*/}" "$list" && return 0
+    if [ "$cat" = "-" ]; then
+        for inc in $(grep -oE 'include[[:space:]]+"[^"]+"' "$f" 2>/dev/null | cut -d'"' -f2); do
+            _yara_name_excluded "${inc##*/}" "$list" && return 0
+        done
+    fi
+    return 1
+}
+
+# Combined compile of all validated rule files, one NAMESPACE per file.
+# $1 = the ClamAV-converted file (one rule per line) or empty.
+# That file can hold hundreds of thousands of rules and yarac's time grows
+# faster than linearly with rule count (measured: 100k rules 8s, 200k 29s,
+# 400k 90s per pass), so it is compiled exactly ONCE — here, as part of the
+# combined set — instead of being pre-checked and isolation-checked first
+# (three full passes). Only if yarac reports errors in it are exactly those
+# lines (yarac names every bad rule's line) dropped and the compile retried,
+# so a single malformed rule can't cost the whole ClamAV set.
+# Uses $YARAC_BIN, yara_extvars, yara_ns_args, out_dir (caller's scope).
+_yara_compile_ns() {
+    local gen="$1" try cerr rc=1 bad nbad total=0
+    for try in 1 2 3; do
+        cerr=$("$YARAC_BIN" "${yara_extvars[@]}" "${yara_ns_args[@]}" "$out_dir/yara/rules.yarc" 2>&1 >/dev/null)
+        rc=$?
+        [ "$rc" -eq 0 ] && break
+        [ -z "$gen" ] && break
+        bad=$(printf '%s\n' "$cerr" | grep '^error' | grep -F 'generated_ndb_ldb.yar(' \
+              | bb sed -E 's/.*generated_ndb_ldb\.yar\(([0-9]+)\).*/\1/' | bb sort -un)
+        [ -z "$bad" ] && break
+        nbad=$(printf '%s\n' "$bad" | bb wc -l | tr -d ' ')
+        total=$((total + nbad))
+        printf '%s\n' "$bad" > "$gen.bad"
+        bb awk 'NR==FNR { d[$1]=1; next } !(FNR in d)' "$gen.bad" "$gen" > "$gen.tmp" && mv -f "$gen.tmp" "$gen"
+        rm -f "$gen.bad" "$gen.tmp"
+    done
+    [ "$total" -gt 0 ] && echo -e "  ${Y}[WARN] ClamAV->YARA: dropped ${total} generated rule(s) that yarac rejected (the rest are kept)${Z}"
+    [ "$rc" -eq 0 ]
+}
+
+# Once rules.yarc exists, the text rule sources next to it — copies of every
+# community .yar plus the ClamAV-converted generated_ndb_ldb.yar — are
+# intermediates: a scan only ever loads rules.yarc and everything unique to
+# them lives in it. Left in place they add roughly half again to the ruleset's
+# footprint on disk and, copied into the working dir, to /dev/shm with
+# --sig-in-ram. They are kept when rules.yarc is missing, since the text
+# fallback (index.yar) is built from them.
+# $1 = a yara/ directory (the working one or the cache's).
+_yara_prune_sources() {
+    local d="$1" f n=0
+    [ -s "$d/rules.yarc" ] || return 0
+    for f in "$d"/*.yar "$d"/*.yara; do
+        [ -f "$f" ] && rm -f "$f" && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && echo "  [*] Removed ${n} intermediate YARA source file(s) — rules.yarc is all a scan needs"
+    return 0
+}
+
 compile_signatures() {
     local sig_input="$1"
     local out_dir="$2"
@@ -2071,6 +2460,7 @@ compile_signatures() {
     # effect for anyone reusing an existing signatures/ directory. Now the
     # cache is also invalidated whenever VERSION doesn't match what it was
     # compiled with.
+    local cache_stamp="$VERSION|$(_yara_profile_key)"
     local cached_version=""
     [ -f "$version_flag" ] && cached_version=$(cat "$version_flag" 2>/dev/null)
 
@@ -2093,17 +2483,23 @@ compile_signatures() {
             -newer "$compiled_flag" -print -quit 2>/dev/null)
     fi
 
-    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ -z "$newest_src" ] && [ "$cached_version" = "$VERSION" ]; then
+    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ -z "$newest_src" ] && [ "$cached_version" = "$cache_stamp" ]; then
         echo -e "[*] Signatures already compiled -> reusing cache ($cache_dir)"
         mkdir -p "$out_dir"
         cp -f "$cache_dir"/sha256.tsv "$cache_dir"/sha1.tsv "$cache_dir"/md5.tsv "$cache_dir"/hex_ere.txt \
               "$cache_dir"/strings.txt "$cache_dir"/b64_payloads.tsv "$cache_dir"/mdb.tsv \
               "$cache_dir"/str_sig_map.tsv "$out_dir/" 2>/dev/null || true
-        [ -d "$cache_dir/yara" ] && cp -rf "$cache_dir/yara" "$out_dir/" 2>/dev/null
+        if [ -s "$cache_dir/yara/rules.yarc" ]; then
+            _yara_prune_sources "$cache_dir/yara"     # caches written by older versions still carry them
+            mkdir -p "$out_dir/yara"
+            cp -f "$cache_dir/yara/rules.yarc" "$out_dir/yara/" 2>/dev/null
+        elif [ -d "$cache_dir/yara" ]; then
+            cp -rf "$cache_dir/yara" "$out_dir/" 2>/dev/null
+        fi
         return 0
     fi
-    [ -n "$cached_version" ] && [ "$cached_version" != "$VERSION" ] && \
-        echo -e "${Y}[*] av.sh version changed ($cached_version -> $VERSION) -> recompiling signatures${Z}"
+    [ -n "$cached_version" ] && [ "$cached_version" != "$cache_stamp" ] && \
+        echo -e "${Y}[*] av.sh version or YARA profile changed ($cached_version -> $cache_stamp) -> recompiling signatures${Z}"
 
     echo -e "[*] Compiling signatures into flat artifacts..."
 
@@ -2236,36 +2632,51 @@ EOF
         function ndb2yara(raw,    s, out, i, c, n, buf, j, spec, inner, alts, cnt, k, a, pa, m, alt_out) {
             s = tolower(raw)
             gsub(/[ \t]+/, "", s)
+            # Negated groups (!(..)) cannot be expressed in a YARA hex string.
+            # The old code turned them into POSITIVE alternations (inverted
+            # logic) — drop the signature instead of mis-converting it.
+            if (index(s, "!") > 0) return ""
             n = length(s)
             out = ""
             buf = ""
             i = 1
             while (i <= n) {
                 c = substr(s, i, 1)
-                if (substr(s, i, 2) == "??") {
+                if (buf == "" && substr(s, i, 2) == "??") {
                     out = out "?? "
                     i += 2
                 } else if (c == "*") {
+                    if (buf != "") return ""
                     out = out "[0-] "
                     i += 1
                 } else if (c == "{") {
+                    if (buf != "") return ""
                     j = index(substr(s, i), "}")
-                    if (j == 0) { i = n + 1 } else {
-                        spec = substr(s, i + 1, j - 2)
-                        if (spec ~ /^[0-9]+$/) out = out "[" spec "] "
-                        else if (spec ~ /^[0-9]+-[0-9]+$/) out = out "[" spec "] "
-                        else if (spec ~ /^[0-9]+-$/) out = out "[" spec "] "
-                        else if (spec ~ /^-[0-9]+$/) out = out "[0" spec "] "
-                        i += j
-                    }
+                    if (j == 0) return ""
+                    spec = substr(s, i + 1, j - 2)
+                    if (spec ~ /^[0-9]+$/) out = out "[" spec "] "
+                    else if (spec ~ /^[0-9]+-[0-9]+$/) out = out "[" spec "] "
+                    else if (spec ~ /^[0-9]+-$/) out = out "[" spec "] "
+                    else if (spec ~ /^-[0-9]+$/) out = out "[0" spec "] "
+                    else return ""
+                    i += j
                 } else if (c == "(") {
+                    if (buf != "") return ""
                     j = index(substr(s, i), ")")
-                    if (j == 0) { i = n + 1 } else {
-                        inner = substr(s, i + 1, j - 2)
+                    if (j == 0) return ""
+                    inner = substr(s, i + 1, j - 2)
+                    if (inner == "b" || inner == "l") {
+                        # (B)/(L) word-boundary markers: no YARA equivalent,
+                        # harmless to drop (they used to become "( b )", which
+                        # yarac rejects — taking the WHOLE generated file with it)
+                        i += j
+                    } else {
                         cnt = split(inner, alts, "|")
+                        if (cnt < 2) return ""
                         alt_out = ""
                         for (k = 1; k <= cnt; k++) {
                             a = alts[k]
+                            if (a !~ /^([0-9a-f][0-9a-f])+$/) return ""
                             pa = ""
                             for (m = 1; m <= length(a); m += 2) pa = pa substr(a, m, 2) " "
                             gsub(/ +$/, "", pa)
@@ -2274,21 +2685,42 @@ EOF
                         out = out "( " alt_out " ) "
                         i += j
                     }
-                } else if (c ~ /[0-9a-f]/) {
+                } else if (c ~ /[0-9a-f?]/) {
+                    # nibble wildcards (a? / ?a) are valid in both ClamAV and
+                    # YARA; the old code dropped the "?" and shifted every
+                    # following nibble, silently turning the signature into
+                    # different bytes that never match the real sample
                     buf = buf c
                     if (length(buf) == 2) { out = out buf " "; buf = "" }
                     i += 1
                 } else {
-                    i += 1
+                    return ""
                 }
             }
+            if (buf != "") return ""
             gsub(/ +$/, "", out)
+            # YARA rejects hex strings that start or end with a wildcard/jump,
+            # and a leading/trailing one adds nothing to a whole-file search
+            while (out ~ /^(\?\? |\[[^]]*\] )/) sub(/^(\?\? |\[[^]]*\] )/, "", out)
+            while (out ~ / (\?\?|\[[^]]*\])$/) sub(/ (\?\?|\[[^]]*\])$/, "", out)
             return out
         }
         function yara_rule_name(base,    r) {
             r = base
             gsub(/[^a-zA-Z0-9_]/, "_", r)
             return "s_" r
+        }
+        # Rule id = the REAL ClamAV signature name (so a finding reads
+        # "s_Win_Test_LilEXE_..." instead of a temp-file path) plus kind
+        # (n=ndb, l=ldb), the parallel chunk id and the line number, which keep
+        # it unique even when ClamAV reuses a family name on many lines.
+        function rule_id(name, kind,    r, t) {
+            r = name
+            gsub(/[^a-zA-Z0-9_]/, "_", r)
+            if (length(r) > 100) r = substr(r, 1, 100)
+            t = FILENAME
+            if (sub(/.*chunk_/, "", t) == 0) t = "x"
+            return "s_" r "_" kind t "_" NR
         }
     '
 
@@ -2381,15 +2813,27 @@ EOF
                 if (n < 4) next
                 yhex = ndb2yara(a[4])
                 if (yhex == "" || length(yhex) < 8) next
-                rname = yara_rule_name("ndb_" FILENAME "_" NR)
-                print "YARARULE\trule " rname " { strings: $a = { " yhex " } condition: $a }"
+                # ClamAV TargetType: 1 = PE, 6 = ELF — the engine only applies
+                # such a signature to files of that type; so do we
+                cond = "$a"
+                if (a[2] == "1") cond = "uint16(0) == 0x5A4D and $a"
+                else if (a[2] == "6") cond = "uint32(0) == 0x464c457f and $a"
+                rname = rule_id(a[1], "n")
+                print "YARARULE\trule " rname " { strings: $a = { " yhex " } condition: " cond " }"
             }
         '
         cat "$tmp_ndb_out" >> "$tmp_raw_sigs"
         rm -f "$tmp_ndb" "$tmp_ndb_out"
     fi
 
-    # --- LDB category (.ldb/.ldu): "Name:Type:Expression:Subsig0:Subsig1:..." ---
+    # --- LDB category (.ldb/.ldu): "Name;TargetBlock;Expression;Subsig0;Subsig1;..." ---
+    # FIX: this used to split on ":" (and this comment said "Name:Type:..."), but
+    # real ClamAV logical signatures are ";"-separated and the target block
+    # itself contains colons ("Engine:90-255,Target:1") — checked against
+    # ClamAV's own test signatures. Every real .ldb line was therefore
+    # mis-split and produced an invalid rule, so no logical signature ever
+    # worked (and, before the sanitizer, one bad rule dropped ALL converted
+    # ClamAV signatures with it).
     # Unlike the old grep-based approach, the boolean AND/OR expression
     # (field 3) is now reconstructed as a real YARA condition instead of
     # being dropped — e.g. ClamAV "(0&1)|2" becomes YARA "($s0 and $s1) or
@@ -2400,7 +2844,7 @@ EOF
         local tmp_ldb="$out_dir/cat_ldb.tmp" tmp_ldb_out="$out_dir/cat_ldb.out"
         cat "${ldb_files[@]}" > "$tmp_ldb"
         run_awk_parallel "$tmp_ldb" "$tmp_ldb_out" "$ndb2yara_fn"'
-            function translate_condition(expr,    out2, j, L, ch, numstr) {
+            function translate_condition(expr, maxidx,    out2, j, L, ch, numstr) {
                 out2 = ""
                 j = 1
                 L = length(expr)
@@ -2410,10 +2854,16 @@ EOF
                         numstr = ch
                         j++
                         while (j <= L && substr(expr, j, 1) ~ /[0-9]/) { numstr = numstr substr(expr, j, 1); j++ }
+                        # a reference to a subsignature that does not exist
+                        # would make yarac reject the rule
+                        if (numstr + 0 > maxidx) return ""
                         out2 = out2 "$s" numstr
                     } else if (ch == "&") { out2 = out2 " and "; j++ }
                     else if (ch == "|") { out2 = out2 " or "; j++ }
-                    else { out2 = out2 ch; j++ }
+                    else if (ch == "(" || ch == ")" || ch == " ") { out2 = out2 ch; j++ }
+                    # match-count operators (>, <, =, ,) have no faithful
+                    # translation here: drop the signature, do not emit junk
+                    else return ""
                 }
                 return out2
             }
@@ -2421,20 +2871,30 @@ EOF
                 line = $0
                 sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
                 if (line == "" || line ~ /^#/) next
-                n = split(line, a, ":")
+                n = split(line, a, ";")
                 if (n < 4) next
                 ok = 1
                 strs = ""
                 for (i = 4; i <= n; i++) {
-                    if (a[i] ~ /^\//) { ok = 0; break }
-                    yhex = ndb2yara(a[i])
+                    sh = a[i]
+                    # optional "offset:" prefix (n, EP+n, EOF-n, *, ...): we
+                    # search the whole file, so the anchor is dropped
+                    if (sh ~ /^[^:\/()]*:/) sub(/^[^:\/()]*:/, "", sh)
+                    # PCRE subsignatures ("trigger/regex/flags"), "::" match
+                    # modifiers and macros have no hex-string equivalent
+                    if (sh ~ /\// || sh ~ /::/ || sh ~ /\$/) { ok = 0; break }
+                    yhex = ndb2yara(sh)
                     if (yhex == "" || length(yhex) < 8) { ok = 0; break }
                     strs = strs "$s" (i - 4) " = { " yhex " } "
                 }
                 if (!ok) next
-                cond = translate_condition(a[3])
+                cond = translate_condition(a[3], n - 4)
                 if (cond == "") next
-                rname = yara_rule_name("ldb_" FILENAME "_" NR)
+                tt = ""
+                if (match(a[2], /Target:[0-9]+/)) tt = substr(a[2], RSTART + 7, RLENGTH - 7)
+                if (tt == "1") cond = "uint16(0) == 0x5A4D and (" cond ")"
+                else if (tt == "6") cond = "uint32(0) == 0x464c457f and (" cond ")"
+                rname = rule_id(a[1], "l")
                 print "YARARULE\trule " rname " { strings: " strs "condition: " cond " }"
             }
         '
@@ -2696,9 +3156,27 @@ EOF
     # files are excluded from sig_files/generic_files below so they're
     # compiled as actual YARA rules, not misrouted as hash/pattern text.
     if [ -d "$sig_input" ]; then
-        bb find "$sig_input" -not -path '*/.git/*' -not -path '*/.cache/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | head -500 | while read -r yf; do
-            cp "$yf" "$out_dir/yara/" 2>/dev/null || true
-        done
+        # Selection is DETERMINISTIC (sorted) and uncapped up to a generous
+        # safety limit. It used to be `find | head -500`: only the first 500 of
+        # ~1300 rule files, in whatever order the filesystem happened to
+        # enumerate directories — so which rules were compiled in depended on
+        # the machine (measured: the same tree gave 500 files from one repo
+        # and 0 from the other under different orders). Copies get a numeric
+        # prefix so same-named files from different repos can't overwrite
+        # each other in the flat directory.
+        _yara_expand_profile
+        local yf yx=0 ycopied=0 ylimit=3000
+        while IFS= read -r yf; do
+            if _yara_file_excluded "$yf" "$sig_input/yara_exclude"; then
+                yx=$((yx + 1)); continue
+            fi
+            if [ "$ycopied" -ge "$ylimit" ]; then
+                echo -e "${Y}[WARN] more than ${ylimit} YARA rule files selected — the rest are NOT loaded; narrow --yara-rules or add to yara_exclude${Z}"
+                break
+            fi
+            cp "$yf" "$out_dir/yara/$(printf '%04d' "$ycopied")_${yf##*/}" 2>/dev/null && ycopied=$((ycopied + 1))
+        done < <(bb find "$sig_input" -not -path '*/.git/*' -not -path '*/.cache/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | bb sort)
+        echo "  [*] YARA rules: profile '$([ "$YARA_ALL" = true ] && echo 'all (--yara-all)' || echo "$YARA_RULES_SPEC")' -> $ycopied file(s) loaded, $yx left out [$(printf '%s' "$YARA_CATS" | sed 's/ *$//; s/ /,/g')]"
     fi
 
     # "filename"/"filepath"/"extension" are external variables in modern
@@ -2718,7 +3196,7 @@ EOF
     local yara_extvars=(-d filename= -d filepath= -d extension=)
 
     local yar_sources
-    yar_sources=$(bb find "$out_dir/yara" -maxdepth 1 \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null)
+    yar_sources=$(bb find "$out_dir/yara" -maxdepth 1 \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | bb sort)
     if [ -n "$yar_sources" ] && [ -n "$YARAC_BIN" ]; then
         # Validate each file in ISOLATION first and only include the ones
         # that compile cleanly — one incompatible rule (unsupported module,
@@ -2727,11 +3205,27 @@ EOF
         # including our own generated NDB/LDB rules.
         local yara_index="$out_dir/yara/_index.yar"
         local skipped=0 included=0
+        local -a yara_ns_args=()
         : > "$yara_index"
+        local gen_file=""
         while IFS= read -r yf; do
             [ -z "$yf" ] && continue
+            if [ "${yf##*/}" = "generated_ndb_ldb.yar" ]; then
+                # our own converter's output: not validated separately (see
+                # _yara_compile_ns) — straight into the combined set
+                gen_file="$yf"
+                echo "include \"$yf\"" >> "$yara_index"
+                yara_ns_args+=("n${included}:$yf")
+                included=$((included + 1))
+                continue
+            fi
             if "$YARAC_BIN" "${yara_extvars[@]}" "$yf" /dev/null &>/dev/null; then
                 echo "include \"$yf\"" >> "$yara_index"
+                # one NAMESPACE per file: the same rule name legitimately
+                # exists in both community repos (e.g. the Laudanum webshell
+                # rules), and a single combined namespace makes yarac refuse
+                # the whole set with "duplicated identifier"
+                yara_ns_args+=("n${included}:$yf")
                 included=$((included + 1))
             else
                 skipped=$((skipped + 1))
@@ -2739,7 +3233,13 @@ EOF
         done <<< "$yar_sources"
         [ "$skipped" -gt 0 ] && echo -e "${Y}[WARN] Skipped ${skipped} incompatible YARA rule file(s) (unsupported module/syntax) — ${included} included${Z}"
 
-        if [ -s "$yara_index" ] && "$YARAC_BIN" "${yara_extvars[@]}" "$yara_index" "$out_dir/yara/rules.yarc" 2>/dev/null; then
+        local t_c0 ngen=0
+        t_c0=$(date +%s)
+        [ -n "$gen_file" ] && ngen=$(grep -c '^rule ' "$gen_file" 2>/dev/null)
+        echo "  [*] Compiling the YARA ruleset: ${included} file(s)$([ -n "$gen_file" ] && echo ", incl. ${ngen} ClamAV-converted rule(s) — the ClamAV part alone can take several minutes (it is not stuck)")..."
+        if [ "${#yara_ns_args[@]}" -gt 0 ] && _yara_compile_ns "$gen_file"; then
+            echo "  [*] YARA ruleset compiled in $(( $(date +%s) - t_c0 ))s"
+        elif [ -s "$yara_index" ] && "$YARAC_BIN" "${yara_extvars[@]}" "$yara_index" "$out_dir/yara/rules.yarc" 2>/dev/null; then
             :
         else
             echo -e "${Y}[WARN] yarac failed on the combined ruleset -> falling back to source (slower)${Z}"
@@ -2788,12 +3288,13 @@ EOF
     # first so a recompile can't leave stale artifacts behind.
     mkdir -p "$cache_dir"
     rm -rf "$cache_dir/yara" 2>/dev/null
+    _yara_prune_sources "$out_dir/yara"
     cp -f "$out_dir"/sha256.tsv "$out_dir"/sha1.tsv "$out_dir"/md5.tsv "$out_dir"/hex_ere.txt \
           "$out_dir"/strings.txt "$out_dir"/b64_payloads.tsv "$out_dir"/mdb.tsv \
           "$out_dir"/str_sig_map.tsv "$cache_dir/" 2>/dev/null || true
     [ -d "$out_dir/yara" ] && cp -rf "$out_dir/yara" "$cache_dir/" 2>/dev/null
     touch "$compiled_flag" 2>/dev/null || true
-    printf '%s' "$VERSION" > "$version_flag" 2>/dev/null || true
+    printf '%s' "$cache_stamp" > "$version_flag" 2>/dev/null || true
 
     echo -e "  SHA256 : ${C}$(bb wc -l < "$out_dir/sha256.tsv" 2>/dev/null | tr -d ' ')${Z}"
     echo -e "  SHA1   : ${C}$(bb wc -l < "$out_dir/sha1.tsv" 2>/dev/null | tr -d ' ')${Z}"
@@ -2920,6 +3421,7 @@ extract_setup_module() {
         echo 'SETUP_COMPILE_ONLY="${SETUP_COMPILE_ONLY:-false}"'
         echo 'BUSYBOX_BIN="${BUSYBOX_BIN:-}"'
         echo 'ALLOW_BUSYBOX="${ALLOW_BUSYBOX:-true}"'
+        echo 'DEBUG_MODE="${DEBUG_MODE:-false}"'
         echo 'OS=""; ARCH=""'
         local inside=false
         while IFS= read -r ln; do
@@ -2929,7 +3431,7 @@ extract_setup_module() {
         done < "$0"
         echo ''
         echo 'detect_platform'
-        echo 'case "$1" in --force) SETUP_FORCE=true ;; esac'
+        echo 'for _a in "$@"; do case "$_a" in --force) SETUP_FORCE=true ;; --debug) DEBUG_MODE=true ;; esac; done'
         echo 'run_self_setup'
     } > "$target"
     chmod +x "$target"
@@ -3196,7 +3698,7 @@ detect_cms() {
 
 print_banner() {
     echo -e "${B}=================================================${Z}"
-    echo -e "${B} Oprhus AV Scanner Unified v${VERSION}${Z}  [OS: $OS | ARCH: $ARCH]"
+    echo -e "${B} Orphus AV Scanner Unified v${VERSION}${Z}  [OS: $OS | ARCH: $ARCH]"
     echo -e " RAM Ceiling  : ${C}${MAX_RAM_MB} MB${Z}"
     echo -e " Workers      : ${C}${WORKERS}${Z}"
     echo -e " Target       : ${C}${ROOT_DIR}${Z}"
@@ -3345,15 +3847,29 @@ collect_files() {
     [ "$QUARANTINE_ENABLED" = true ] && self_paths+=("$QUARANTINE_DIR")
     local p
     for p in "${self_paths[@]}"; do
-        [ -n "$p" ] && excl+=(-not -path "$p" -not -path "${p}/*")
+        [ -z "$p" ] && continue
+        [ "$p" != "/" ] && p="${p%/}"
+        excl+=(-not -path "$p" -not -path "${p}/*")
     done
     for p in "$LIVE_REPORT_FILE" "$OUTPUT_FILE"; do
         [ -n "$p" ] && excl+=(-not -path "$p")
     done
 
     # User-specified extra exclusions (-X/--exclude, repeatable)
+    # FIX (real bug reported): a trailing slash in the person's OWN input
+    # (e.g. "-X /mnt/home/", a completely natural way to type a directory
+    # path) silently broke BOTH generated patterns — "-not -path
+    # '/mnt/home/'" can never match a directory (find reports it WITHOUT
+    # the trailing slash), and "-not -path '/mnt/home//*'" needs a
+    # literal double-slash in the real path to match, which normal
+    # filesystem paths never have. Confirmed directly: with the trailing
+    # slash, find excluded NOTHING; stripped, it worked correctly.
+    # Strip exactly one trailing slash (unless the path IS just "/") before
+    # building the pattern.
     for p in "${EXCLUDE_PATHS[@]}"; do
-        [ -n "$p" ] && excl+=(-not -path "$p" -not -path "${p}/*")
+        [ -n "$p" ] || continue
+        [ "$p" != "/" ] && p="${p%/}"
+        excl+=(-not -path "$p" -not -path "${p}/*")
     done
 
     # FIX (real bug found, pre-existing — not introduced by incremental
@@ -3419,23 +3935,36 @@ collect_files() {
     # Renamed to a pattern that can't collide with that glob; the
     # aggregation call sites explicitly include it as a second path
     # alongside pool_*.txt instead.
-    local anomaly_report="$WORK_DIR/reports/anomaly_findings.txt"
-    : > "$anomaly_report" 2>/dev/null
-    while IFS= read -r -d '' af; do
-        case "$af" in
-            *$'\n'*|*$'\t'*)
-                printf 'THREAT:SUSPICIOUS_FILENAME|%s|contains embedded newline/tab byte in the filename itself -- not scanned via the normal pipeline, which splits on these; investigate directly\n' \
-                    "$(printf '%s' "$af" | tr '\n\t' '??')" >> "$anomaly_report"
-                ;;
-        esac
-    # NOTE: uses "command find" (system find), NOT bb find here —
-    # confirmed directly that busybox find's own -print0 is unreliable
-    # for exactly the kind of filename this pass exists to catch: on a
-    # file with an embedded literal newline byte, busybox find's -print0
-    # output was truncated right at that byte (missing the rest of the
-    # name and the NUL terminator), while system find handled the same
-    # file correctly. Using busybox here would defeat the whole point.
-    done < <(command find "$ROOT_DIR" -type f "${excl[@]}" -print0 2>/dev/null)
+    # FIX (real perf problem reported: ~9 minutes to index 3M files):
+    # this used to run a SEPARATE, FULL SECOND `find -print0` traversal
+    # of the ENTIRE target tree just to catch anomalous filenames —
+    # doubling the filesystem-walk cost on every scan, dominant exactly
+    # at the multi-million-file scale where it hurts most. The same
+    # detection is derivable from the MAIN find pass's OWN output
+    # instead, with zero extra tree-walking: an embedded newline in a
+    # filename SPLITS that record across two lines of the -printf output
+    # (confirmed directly) — the first half still looks like a normal,
+    # well-formed "size\tmode\tmtime\tpath..." line (just with a
+    # truncated path), but the second half is an orphaned fragment that
+    # does NOT start with the expected "digit\tdigit\tfloat\t" prefix.
+    # Grepping the ALREADY-COLLECTED listing for lines that don't match
+    # that prefix finds exactly those orphaned fragments — same
+    # detection, one tree-walk instead of two. Only applies on the
+    # sys_find_printf_ok path (the common case); the plain -print
+    # fallback (no GNU find) doesn't have a structured prefix to check
+    # against, so this pass is skipped there rather than adding back a
+    # separate full traversal for a less-common environment.
+    if [ "$sys_find_printf_ok" = true ]; then
+        local anomaly_report="$WORK_DIR/reports/anomaly_findings.txt"
+        : > "$anomaly_report" 2>/dev/null
+        local src="$WORK_DIR/all_files_raw.tsv"
+        [ -f "$src" ] || src="$WORK_DIR/all_files.tsv"
+        bb grep -vE '^[0-9]+	[0-9]+	[0-9.]+	' "$src" 2>/dev/null | while IFS= read -r frag; do
+            [ -z "$frag" ] && continue
+            printf 'THREAT:SUSPICIOUS_FILENAME|(fragment, see info)|orphaned line fragment "%s" found in the file listing -- consistent with a filename containing an embedded newline/tab byte, which splits it across lines in the normal collection pass; investigate the target tree directly (e.g. find PATH -type f -print0 | ...) to locate the actual file\n' \
+                "$(printf '%s' "$frag" | tr '\t' '?' | head -c 200)" >> "$anomaly_report"
+        done
+    fi
 }
 
 split_pools() {
@@ -3472,7 +4001,7 @@ launch_workers() {
             "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
             "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
             "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM" "$GENERIC_OBFUSCATION_RULES_FILE" "$KNOWN_VENDOR_OBFUSCATION_FILE" "$SANDBOX_MODE" "$SANDBOX_USER" "$SANDBOX_MEM_KB" "$SANDBOX_CPU_SEC" "$DEEP_MODE" "$SHA1_CMD" "$$" "$QUARANTINE_DRY_RUN" "$QUARANTINE_SKIP_ARCHIVES"
+            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM" "$GENERIC_OBFUSCATION_RULES_FILE" "$KNOWN_VENDOR_OBFUSCATION_FILE" "$SANDBOX_MODE" "$SANDBOX_USER" "$SANDBOX_MEM_KB" "$SANDBOX_CPU_SEC" "$DEEP_MODE" "$SHA1_CMD" "$$" "$QUARANTINE_DRY_RUN" "$QUARANTINE_SKIP_ARCHIVES" "$SUID_REPORT_FILE"
         WORKER_PIDS+=($!)
     done
 }
@@ -3487,8 +4016,33 @@ wait_for_workers() {
 # ============================================================================
 # 13. MODULE: progress monitor / cleanup
 # ============================================================================
+# Last resort of the RAM ceiling: SIGKILL the biggest yara process under the
+# given root PIDs. Safe by construction — the worker that owned it sees the
+# signal exit and rescans that batch file by file (see process_yara_batch), so
+# nothing is silently counted as clean. Echoes "pid mb" of the victim.
+_ram_kill_biggest_yara() {
+    local out victim
+    out=$(ps -eo pid=,ppid=,rss=,comm= 2>/dev/null)
+    victim=$(printf '%s\n' "$out" | bb awk -v roots="$*" -v yb="${YARA_CMD##*/}" '
+        BEGIN { n=split(roots, r, " "); for(i=1;i<=n;i++) mark[r[i]]=1 }
+        { pid[NR]=$1; ppid[NR]=$2; rss[NR]=$3; comm[NR]=$4; cnt=NR }
+        END {
+            do { ch=0
+                for(i=1;i<=cnt;i++) if(!(pid[i] in mark) && (ppid[i] in mark)) { mark[pid[i]]=1; ch=1 }
+            } while(ch)
+            best=0; bp=""
+            for(i=1;i<=cnt;i++) if((pid[i] in mark) && comm[i]==yb && rss[i]>best) { best=rss[i]; bp=pid[i] }
+            if (bp != "") print bp, int(best/1024)
+        }')
+    [ -n "$victim" ] || return 1
+    set -- $victim
+    kill -KILL "$1" 2>/dev/null || return 1
+    echo "$victim"
+}
+
 show_progress() {
     local prev=0 prev_ms="$START_MS"
+    local over_ticks=0 gate_file="$WORK_DIR/reports/.ram_high" ev_file="$WORK_DIR/reports/.ram_events"
     tput civis 2>/dev/null || true
     printf '\n\n\n\n\n'
     while true; do
@@ -3527,17 +4081,24 @@ show_progress() {
 
         local mem_mb=0
         if [ "${#active_pids[@]}" -gt 0 ]; then
-            # Workers spend most of their active time inside short-lived
-            # CHILD processes (grep against a 600k+ line md5.tsv, yara,
-            # dd/od) rather than holding memory in the worker bash process
-            # itself — summing only the parent PIDs' own RSS massively
-            # undercounts real usage (reads as ~0MB even under real load).
-            # Include direct children too.
-            local ppid_list child_pids all_pids
-            ppid_list=$(IFS=,; echo "${active_pids[*]}")
-            child_pids=$(ps --ppid "$ppid_list" -o pid= 2>/dev/null | tr -d ' ')
-            all_pids="${active_pids[*]} $child_pids"
-            mem_mb=$(ps -o rss= -p $all_pids 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}')
+            # FIX (real bug reported, confirmed on a 24-worker scan: htop
+            # showed ~5GB in use by ~25 yara processes at 170-350MB each,
+            # while this counter said 419MB): this used to sum the workers
+            # plus their DIRECT children only (`ps --ppid`). But yara never
+            # runs as a direct child — it runs as worker -> $(...) subshell
+            # -> timeout -> yara, so every actual yara process (the biggest
+            # memory consumer, each one loading the whole compiled rule
+            # set) was invisible and only the shared signature DB in
+            # /dev/shm was being counted. Walk the FULL descendant tree of
+            # every worker instead (reproduced in isolation: a 150MB
+            # process under worker->timeout showed as 5MB with the old
+            # method, 163MB with this one). One `ps` call per tick, tree
+            # closure done in awk, so cost stays flat as workers grow.
+            # Caveat: RSS double-counts pages genuinely shared between
+            # processes (small for yara — rules are private heap), so this
+            # errs slightly high rather than low, the safe direction for
+            # a ceiling.
+            mem_mb=$(_tree_rss_mb "${active_pids[@]}")
         fi
         # FIX (real bug reported): process RSS is BLIND to /dev/shm
         # (tmpfs) usage — reading a file from tmpfs doesn't inflate the
@@ -3566,6 +4127,36 @@ show_progress() {
         local ram_pct=0
         [ "$MAX_RAM_MB" -gt 0 ] && ram_pct=$(( mem_mb * 100 / MAX_RAM_MB ))
 
+        # ---- RAM ceiling enforcement (it used to be display-only) ----
+        # >= 90%: raise a gate — workers hold back from STARTING new yara
+        #   processes (each one loads the whole compiled ruleset), so running
+        #   ones finish and memory drains; nothing is lost. Cleared at <= 75%.
+        # >= 105% for 4 ticks in a row despite the gate: SIGKILL the biggest
+        #   yara; its batch is rescanned file by file by the worker.
+        if [ "$MAX_RAM_MB" -gt 0 ]; then
+            if [ "$ram_pct" -ge 90 ]; then
+                [ -e "$gate_file" ] || { : > "$gate_file"; echo "$(date +%H:%M:%S) gate ON  at ${mem_mb}MB (${ram_pct}%)" >> "$ev_file"; }
+            elif [ "$ram_pct" -le 75 ] && [ -e "$gate_file" ]; then
+                rm -f "$gate_file"; echo "$(date +%H:%M:%S) gate OFF at ${mem_mb}MB (${ram_pct}%)" >> "$ev_file"
+            fi
+            if [ "$ram_pct" -ge 105 ]; then
+                # a mild overshoot may just be yara loading its ruleset, so give
+                # it 4 ticks; a big one (>= 150%) can't wait that long
+                local need=4
+                [ "$ram_pct" -ge 150 ] && need=2
+                over_ticks=$(( over_ticks + 1 ))
+                if [ "$over_ticks" -ge "$need" ]; then
+                    local vic; vic=$(_ram_kill_biggest_yara "${active_pids[@]}")
+                    [ -n "$vic" ] && echo "$(date +%H:%M:%S) KILLED yara pid=${vic% *} (${vic#* } MB) at ${mem_mb}MB (${ram_pct}%)" >> "$ev_file"
+                    # still over after this kill? then the NEXT tick may kill
+                    # again without waiting out a fresh countdown
+                    over_ticks=$(( need - 1 ))
+                fi
+            else
+                over_ticks=0
+            fi
+        fi
+
         local cpu_load="0.00"
         if [ -r /proc/loadavg ]; then
             cpu_load=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
@@ -3584,6 +4175,40 @@ show_progress() {
         printf '\033[K'"${B}ETA      :${Z} %s\n" "$eta"
         sleep 1
     done
+}
+
+# Total RSS (MB) of the given root PIDs plus ALL their descendants,
+# not just direct children — see the comment at its one call site in
+# start_monitor() for why direct children aren't enough.
+_tree_rss_mb() {
+    local out res rss_mb anon
+    out=$(ps -eo pid=,ppid=,rss= 2>/dev/null)
+    [ -z "$out" ] && out=$(ps -o pid=,ppid=,rss= 2>/dev/null)
+    res=$(printf '%s\n' "$out" | bb awk -v roots="$*" '
+        BEGIN { n=split(roots, r, " "); for(i=1;i<=n;i++) mark[r[i]]=1 }
+        { pid[NR]=$1; ppid[NR]=$2; rss[NR]=$3; cnt=NR }
+        END {
+            do { ch=0
+                for(i=1;i<=cnt;i++) if(!(pid[i] in mark) && (ppid[i] in mark)) { mark[pid[i]]=1; ch=1 }
+            } while(ch)
+            for(i=1;i<=cnt;i++) if(pid[i] in mark) { s+=rss[i]; print "P", pid[i] }
+            print "S", int(s/1024)
+        }')
+    rss_mb=$(printf '%s\n' "$res" | bb awk '$1=="S" {print $2}')
+    # The ceiling is about memory that can actually run out, which is the
+    # processes' ANONYMOUS memory (RssAnon). Plain RSS also counts file pages
+    # a process has mapped — yara maps every file it scans, up to
+    # MAX_SCAN_MB each — and those are reclaimable page cache, not pressure
+    # (measured: scanning a 150MB file with trivial rules showed RSS=135MB,
+    # RssAnon=0). tmpfs (/dev/shm) is added separately by the caller, so
+    # RssShmem is deliberately not counted here to avoid counting it twice.
+    # Falls back to RSS where the kernel doesn't report RssAnon (< 4.5).
+    if grep -q '^RssAnon:' /proc/self/status 2>/dev/null; then
+        anon=$(cd /proc 2>/dev/null && printf '%s\n' "$res" | bb awk '$1=="P" {print $2 "/status"}' \
+               | xargs grep -hE '^RssAnon:' 2>/dev/null | bb awk '{s+=$2} END {print int(s/1024)}')
+        [ -n "$anon" ] && { echo "$anon"; return; }
+    fi
+    echo "${rss_mb:-0}"
 }
 
 start_monitor() {
@@ -3679,6 +4304,12 @@ build_report() {
     local suppressed_line=""
     [ "${SC:-0}" -gt 0 ] 2>/dev/null && suppressed_line="
  Suppressed (ignore_sigs / known vendor obfuscation): $SC"
+    local ram_line="" _ev="$WORK_DIR/reports/.ram_events" _ng _nk
+    if [ -s "$_ev" ]; then
+        _ng=$(grep -c 'gate ON' "$_ev" 2>/dev/null); _nk=$(grep -c 'KILLED' "$_ev" 2>/dev/null)
+        ram_line="
+ RAM limiter        : held back new yara starts ${_ng:-0}x, killed ${_nk:-0} yara process(es) — ceiling ${MAX_RAM_MB} MB was reached (raise --max-ram or lower -j; killed batches were rescanned per file)"
+    fi
     local skipped_line=""
     [ "$INCREMENTAL_MODE" = true ] && skipped_line="
  Skipped (unchanged): $SKIPPED_UNCHANGED (incremental cache: $INCREMENTAL_CACHE_FILE)"
@@ -3703,12 +4334,12 @@ build_report() {
 
     RPT="
 =================================================
- SCAN RESULTS  (Oprhus Unified v${VERSION})
+ SCAN RESULTS  (Orphus Unified v${VERSION})
 =================================================
  OS / Arch          : $OS / $ARCH
  Target             : $ROOT_DIR
  Files Scanned      : $TF
- Threats Found      : $TT${quarantine_line}${suppressed_line}${skipped_line}
+ Threats Found      : $TT${quarantine_line}${suppressed_line}${skipped_line}${ram_line}
  Time Elapsed       : $(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
  Avg Speed          : ${SPEED} files/s
  Workers            : $WORKERS${timing_line}
@@ -3722,7 +4353,7 @@ print_report() {
         local suid_count
         suid_count=$(bb grep -c "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | bb awk -F: '{s+=$2} END{print s+0}')
         echo -e "\n${R}${B}=== DETECTED THREATS ===${Z}"
-        bb grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
+        bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
             | bb grep -v "^THREAT:SUID_SGID|" \
             | cut -d: -f2- | bb sort -u \
             | while IFS='|' read -r type file info; do
@@ -3743,7 +4374,14 @@ save_report() {
         echo "$RPT"
         [ "$TT" -gt 0 ] && {
             echo -e "\n=== DETECTED THREATS ==="
-            bb grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
+            # FIX (real bug found in testing): grep given MULTIPLE file
+            # arguments prefixes every matched line with "filename:" —
+            # meaning the SECOND grep's "^THREAT:SUID_SGID|" anchor never
+            # matched (the line actually started with the pool file's own
+            # path, not literally "THREAT:"), so the SUID exclusion
+            # silently did nothing despite looking correct. "-h"
+            # suppresses that filename prefix.
+            bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
                 | bb grep -v "^THREAT:SUID_SGID|" \
                 | cut -d: -f2- | bb sort -u
         }
@@ -3755,10 +4393,10 @@ save_report() {
     # actually anything to put in it (no empty companion file otherwise).
     if bb grep -q "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null; then
         {
-            echo "# Oprhus AV Scanner — SUID/SGID findings (split out from the main report)"
+            echo "# Orphus AV Scanner — SUID/SGID findings (split out from the main report)"
             echo "# Target: $ROOT_DIR"
             echo ""
-            bb grep "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | cut -d: -f2- | bb sort -u
+            bb grep -h "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | cut -d: -f2- | bb sort -u
         } > "$SUID_REPORT_FILE" 2>/dev/null
         echo -e "[*] SUID/SGID report saved: ${C}${SUID_REPORT_FILE}${Z}"
     fi
@@ -3799,7 +4437,7 @@ start_realtime_worker() {
         "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
         "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
         "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM" "$GENERIC_OBFUSCATION_RULES_FILE" "$KNOWN_VENDOR_OBFUSCATION_FILE" "$SANDBOX_MODE" "$SANDBOX_USER" "$SANDBOX_MEM_KB" "$SANDBOX_CPU_SEC" "$DEEP_MODE" "$SHA1_CMD" "$$" "$QUARANTINE_DRY_RUN" "$QUARANTINE_SKIP_ARCHIVES"
+        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM" "$GENERIC_OBFUSCATION_RULES_FILE" "$KNOWN_VENDOR_OBFUSCATION_FILE" "$SANDBOX_MODE" "$SANDBOX_USER" "$SANDBOX_MEM_KB" "$SANDBOX_CPU_SEC" "$DEEP_MODE" "$SHA1_CMD" "$$" "$QUARANTINE_DRY_RUN" "$QUARANTINE_SKIP_ARCHIVES" "$SUID_REPORT_FILE"
     REALTIME_WORKER_PID=$!
 
     # Keep the write fd (3) open permanently — opening/closing per event
@@ -3922,6 +4560,7 @@ main() {
         extract_setup_module
         local setup_args=()
         [ "${SETUP_FORCE:-false}" = true ] && setup_args+=(--force)
+        [ "${DEBUG_MODE:-false}" = true ] && setup_args+=(--debug)
         "$WORKER_BASH" "$SCRIPT_DIR/setup_module.sh" "${setup_args[@]}"
         exit $?
     fi
@@ -3965,6 +4604,7 @@ main() {
 
     extract_worker
     compile_signatures "$SIGNATURES" "$SIG_DIR"
+    _yara_ram_cap "$SIG_DIR/yara/rules.yarc"
 
     if [ "$SCAN_PROCESSES" = true ]; then
         if [ -n "$OFFLINE_ROOT" ]; then
@@ -4172,6 +4812,9 @@ QUARANTINE_DRY_RUN="${42:-false}"  # --quarantine-dry-run: report what
                                  # WOULD be quarantined without touching
                                  # any file — see quarantine_file() below.
 QUARANTINE_SKIP_ARCHIVES="${43:-false}"  # --no-quarantine-archives
+SUID_REPORT_FILE="${44:-}"     # companion file for SUID_SGID live-stream
+                                 # writes — see threat() for why this needs
+                                 # to exist here too, not just in save_report()
 
 REPORT="$REPORT_DIR/${WORKER_ID}.txt"
 PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
@@ -4242,6 +4885,28 @@ _has_real_grep() {
     { [ -n "$GREP_BIN" ] && [ -x "$GREP_BIN" ]; } || command -v grep &>/dev/null
 }
 MAX_SIZE=$(( MAX_SCAN_MB * 1024 * 1024 ))
+# Images with a valid JPEG/PNG/GIF header used to skip YARA entirely, so a
+# classic polyglot (GIF89a... followed by <?php eval ...) was never checked by
+# any YARA rule — including Yara-Rules' own WShell_PHP_in_images. They now go
+# through one cheap grep per batch for script markers (a real image has no
+# reason to contain any; every one of these is >= 5 bytes, so chance hits in
+# random pixel data are negligible) and only the files that hit are handed to
+# YARA. --deep skips the prefilter and runs YARA on every image.
+IMG_SCRIPT_RE='<\?php|<\?= *\$|<script|eval *\(|base64_decode *\(|gzinflate *\(|\$_(GET|POST|REQUEST|COOKIE|SERVER)\['
+_flush_image_batch() {
+    [ "${#BATCH_IMG[@]}" -eq 0 ] && return
+    local hit
+    while IFS= read -r -d '' hit; do
+        [ -z "$hit" ] && continue
+        BATCH_YARA+=("$hit")
+        YARA_BATCH_CNT=$(( YARA_BATCH_CNT + 1 ))
+        if [ "$YARA_BATCH_CNT" -ge "$BATCH_SIZE" ]; then
+            _timed_yara_batch "${BATCH_YARA[@]}"
+            BATCH_YARA=(); YARA_BATCH_CNT=0
+        fi
+    done < <(_real_grep -l -Z -a -i -E -e "$IMG_SCRIPT_RE" -- "${BATCH_IMG[@]}" 2>/dev/null)
+    BATCH_IMG=()
+}
 
 HAS_SHA256=false
 HAS_SHA1=false
@@ -4260,6 +4925,7 @@ declare -a BATCH_SHA=()
 declare -a BATCH_SHA1=()
 declare -a BATCH_MD5=()
 declare -a BATCH_YARA=()
+declare -a BATCH_IMG=()
 declare -a BATCH_HEUR=()
 declare -a BATCH_PE=()
 SHA_BATCH_CNT=0
@@ -4358,6 +5024,118 @@ _resolve_str_sig() {
     [ -z "$pat" ] && return 1
     echo "$pat"
     return 0
+}
+
+# Returns success (0) if the given YARA rule name is a built-in,
+# hardcoded reject — rules confirmed (direct, real-world testing: two
+# separate whole-disk scans) to be too generically-written to ever carry
+# useful signal, not situationally-ambiguous like vendor obfuscation.
+# Unlike _is_vendor_obfuscation() below, this does NOT require a second,
+# content-based condition — these rule names alone are reason enough,
+# and unlike ignore_sigs/vendor-obfuscation, DEEP_MODE does NOT bypass
+# this: there is no "maybe worth a human glance during paranoid review"
+# value here the way there can be for a suppressed vendor-obfuscation
+# match, just noise, so --deep gets the same quiet rejection as normal
+# mode. Intentionally built into the script itself, not left to
+# ignore_sigs, so every install gets this by default without needing to
+# know to add it by hand.
+#
+# First batch — one real scan, 96.8% of ALL findings (38,679 of 39,356):
+# "domain"/"contains_base64"/"url"/"IP" are generic indicator-style rules
+# that fire on nearly any binary/config file's byte content, and
+# "android_meterpreter" matched GRUB's module-dependency list, php.ini,
+# an Exim mail-server ACL, and ImageMagick's policy.xml — files with no
+# conceivable connection to each other or to actual Android malware.
+#
+# Second batch — a later scan, same signature set, 89.9% of that run's
+# findings (12,250 of 13,627), every single one sample-checked by hand:
+# Big_Numbers0/1/3 and CRC32_poly_Constant/CRC32_table/MD5_Constants/
+# SHA2_BLAKE2_IVs/BASE64_table all just mean "this file contains a
+# well-known, PUBLICLY STANDARDIZED algorithm constant table" — matched
+# GRUB's own gcry_md5.mod/gcry_sha256.mod (modules literally named after
+# the algorithm), libphp5.so (the PHP interpreter itself), phar.so, and
+# libetpan.so (a mail library using base64 for MIME, as mail libraries
+# legitimately do). vmdetect/vmdetect_misc/VMWare_Detection/
+# Qemu_Detection/VirtualBox_Detection matched completely ordinary files
+# on a target that is itself a QEMU guest (confirmed via qemu-ga running)
+# — this is what legitimate guest-tools code checking its own hypervisor
+# looks like, not malware evading analysis. powershell matched vim,
+# Python's own venv/__init__.py and its .pyc cache — on a Linux box, no
+# less. maldoc_getEIP_method_1 matched ZendGuardLoader.so (itself a
+# legitimate PHP code-protection tool), dom.so, and the "cksum" utility.
+# PM_Email_Sent_By_PHP_Script matched php.ini — a config file, not a
+# script. without_attachments/without_images matched fail2ban's own
+# stock sendmail notification templates. spyeye matched a kernel
+# System.map symbol listing and the standard btrfs-convert/
+# btrfs-find-root tools. Misc_Suspicious_Strings is a generic catch-all
+# by design, same problem as the first batch's "domain"/"url"/etc.
+# Third batch — a third scan, same signature set, 701 of that run's 946
+# rule-tagged findings (74%), every rule sample-checked by hand again:
+# rootkit/exploit matched /usr/include/.../unistd.h and syscall.h (the
+# STANDARD C headers defining syscall numbers — every compiled C program
+# on the system includes these) plus linux-headers-* kernel build files
+# (Module.symvers, syscalls_64.h) — a "detects syscall-table tampering"
+# rule inevitably matches the files that DEFINE the syscall table in the
+# first place. RIPEMD160/SHA1/SHA512/BLOWFISH/RijnDael_AES(_CHAR)/
+# SipHash/CRC32b/CRC32c_Constants are the same "contains a well-known
+# algorithm constant table" problem as the second batch, just more
+# algorithms — and Big_Numbers2/4 are the same rule FAMILY as
+# Big_Numbers0/1/3 below, just two more variants. Antivirus matched
+# Ansible's own Windows-management PowerShell helper scripts and
+# compiled Python bytecode. PoetRat_Python (a real malware family name)
+# matched PHP's gd.so/imagick.so image libraries. memory_shylock (also a
+# real trojan name) matched Ubuntu's OWN autoinstall.yaml and cloud-init
+# installer logs. Browsers matched more Ansible Windows modules.
+# php_uname matched PHP's own build/test tooling (run-tests.php,
+# pearcmd.php) — part of the standard PHP distribution, not a webshell
+# fingerprinting itself. with_sqlite/with_urls/without_urls are the same
+# paired with/without-indicator family as without_attachments/
+# without_images below, matching fail2ban's own stock templates again.
+# spyeye_plugins is the same rule family as spyeye below.
+# Fourth batch — a fourth scan (549 findings, 427 YARA matches, ~398 of
+# them from these 28 rules), sample-checked by hand: Cerberus matched
+# /etc/apache2/magic (the libmagic file-type database, a config file);
+# Rooter/RooterStrings matched perf and lto-dump; Warp matched gettext
+# .mo translation files; Dropper_Strings matched php's run-tests.php and
+# containerd; System_Tools/WMI_strings matched Ansible's Windows-
+# management modules. anti_dbg/SEH_*/DebuggerException__* are Windows PE
+# rules that matched pip's own t32.exe/w32.exe launcher stubs.
+# invalid_trailer_structure/ppaction are PDF-malware rules that matched
+# stock PDF documentation; maldoc_OLE_file_magic_number matched the php
+# binaries themselves. Email_Generic_Phishing matched exim4's and
+# manpages' documentation; possible_exploit matched libgs.so, glib NEWS
+# and web-server ACCESS LOGS (logs naturally contain visitors' attack
+# strings — that's a log-scanning job, not a file infection). The rest
+# (SHA3/WHIRLPOOL/Chacha/DES/CRC16/ecc_order/OpenSSL_DSA/Big_Numbers5/
+# with_images) are the same "contains a well-known algorithm constant
+# table" family as the earlier batches. NOT sample-checked individually,
+# added by family membership: WarpStrings, SEH_Init,
+# DebuggerException__SetConsoleCtrl, DES_Long, OpenSSL_DSA.
+_is_builtin_noisy_rule() {
+    case "$1" in
+        domain|contains_base64|url|IP|android_meterpreter| \
+        Big_Numbers0|Big_Numbers1|Big_Numbers2|Big_Numbers3|Big_Numbers4| \
+        Misc_Suspicious_Strings| \
+        vmdetect|vmdetect_misc|VMWare_Detection|Qemu_Detection|VirtualBox_Detection| \
+        powershell|spyeye|spyeye_plugins|BASE64_table| \
+        CRC32_poly_Constant|CRC32_table|CRC32b_poly_Constant|CRC32c_poly_Constant| \
+        maldoc_getEIP_method_1|without_attachments|without_images| \
+        without_urls|with_urls|with_sqlite| \
+        SHA2_BLAKE2_IVs|MD5_Constants|SHA1_Constants|SHA512_Constants| \
+        RIPEMD160_Constants|BLOWFISH_Constants|RijnDael_AES|RijnDael_AES_CHAR| \
+        SipHash_big_endian_constants| \
+        PM_Email_Sent_By_PHP_Script|Antivirus|Browsers|php_uname| \
+        PoetRat_Python|memory_shylock|rootkit|exploit| \
+        SHA3_constants|WHIRLPOOL_Constants|Chacha_256_constant|Big_Numbers5| \
+        DES_sbox|DES_Long|CRC16_table|ecc_order|OpenSSL_DSA|with_images| \
+        Cerberus|Rooter|RooterStrings|Warp|WarpStrings|Dropper_Strings| \
+        System_Tools|WMI_strings| \
+        anti_dbg|SEH_Save|SEH_Init|DebuggerException__SetConsoleCtrl| \
+        DebuggerException__ConsoleCtrl| \
+        invalid_trailer_structure|ppaction|maldoc_OLE_file_magic_number| \
+        Email_Generic_Phishing|possible_exploit) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # Returns success (0) if a YARA match should be auto-suppressed as known,
@@ -4851,35 +5629,56 @@ _sandbox_run_chroot() {
     mkdir -p "${chroot_dir}${target_dir}" 2>/dev/null
 
     local -a mounted=()
-    _cbind() { mount --bind "$1" "$2" 2>/dev/null && mounted+=("$2"); }
-    [ -d /bin ]   && _cbind /bin   "$chroot_dir/bin"
-    [ -d /lib ]   && _cbind /lib   "$chroot_dir/lib"
-    [ -d /lib64 ] && _cbind /lib64 "$chroot_dir/lib64"
-    [ -d /usr ]   && _cbind /usr   "$chroot_dir/usr"
-    [ -d /sbin ]  && _cbind /sbin  "$chroot_dir/sbin"
+    local _bind_failed=false
+    # FIX (CRITICAL, found in review — a real "our own busybox disappeared
+    # mid-scan" report led here): _cbind() used to be a PLAIN mount --bind
+    # with no read-only step at all for /bin,/lib,/lib64,/usr,/sbin — the
+    # entire point of this sandbox is to contain a potentially HOSTILE,
+    # attacker-crafted archive during extraction, and it was binding real
+    # system directories into that jail WRITABLE. Separately, the archive_dir
+    # and busybox binds DID attempt a read-only remount, but never checked
+    # whether it actually succeeded (`2>/dev/null` swallows the failure) —
+    # confirmed directly that `mount --bind` alone is read-write and the
+    # follow-up `remount,ro` is a genuinely separate step that can fail on
+    # its own, silently leaving a writable bind mount of OUR OWN tools
+    # directory (where busybox/yara/grep/bash live) inside the jail. Every
+    # bind here is now read-only AND VERIFIED; if read-only can't be
+    # confirmed for ANY of them, the whole chroot attempt aborts and falls
+    # back to unsandboxed extraction rather than silently running with a
+    # writable hole in the isolation it exists to provide.
+    _cbind() {
+        mount --bind "$1" "$2" 2>/dev/null || return 1
+        mounted+=("$2")
+        mount -o remount,ro,bind "$2" 2>/dev/null
+        mountpoint -q "$2" 2>/dev/null && [ ! -w "$2" ] 2>/dev/null
+    }
+    [ -d /bin ]   && { _cbind /bin   "$chroot_dir/bin"   || _bind_failed=true; }
+    [ -d /lib ]   && { _cbind /lib   "$chroot_dir/lib"   || _bind_failed=true; }
+    [ -d /lib64 ] && { _cbind /lib64 "$chroot_dir/lib64" || _bind_failed=true; }
+    [ -d /usr ]   && { _cbind /usr   "$chroot_dir/usr"   || _bind_failed=true; }
+    [ -d /sbin ]  && { _cbind /sbin  "$chroot_dir/sbin"  || _bind_failed=true; }
     mount -t proc proc "$chroot_dir/proc" 2>/dev/null && mounted+=("$chroot_dir/proc")
-    _cbind "$target_dir" "${chroot_dir}${target_dir}"
+    # target_dir (the extraction destination) legitimately needs to stay
+    # writable — that's where the archive's own contents get written —
+    # so it deliberately does NOT go through the read-only _cbind above.
+    mount --bind "$target_dir" "${chroot_dir}${target_dir}" 2>/dev/null && mounted+=("${chroot_dir}${target_dir}")
 
-    # FIX (same class of bug as bwrap mode, found right after fixing that
-    # one): the archive file itself lives OUTSIDE target_dir — bind its
+    # The archive file itself lives OUTSIDE target_dir — bind its
     # containing directory too (read-only), same real path, so the
     # extraction command can still open its own input file inside the jail.
     if [ -n "$archive_src" ]; then
         local archive_dir; archive_dir=$(dirname "$archive_src")
         mkdir -p "${chroot_dir}${archive_dir}" 2>/dev/null
-        mount --bind "$archive_dir" "${chroot_dir}${archive_dir}" 2>/dev/null && mount -o remount,ro,bind "${chroot_dir}${archive_dir}" 2>/dev/null
-        mounted+=("${chroot_dir}${archive_dir}")
+        _cbind "$archive_dir" "${chroot_dir}${archive_dir}" || _bind_failed=true
     fi
 
-    # FIX (third instance of the same bug, found right after archive_src):
-    # the extraction tool itself is very often our own bundled busybox,
+    # The extraction tool itself is very often our own bundled busybox,
     # installed under this scanner's OWN directory — not /bin or /usr —
-    # so it was ALSO invisible inside the jail. Bind that in too.
+    # so it was ALSO invisible inside the jail. Bind that in too, read-only.
     if [ -n "$BUSYBOX_BIN" ] && [ -x "$BUSYBOX_BIN" ]; then
         local bb_dir; bb_dir=$(dirname "$BUSYBOX_BIN")
         mkdir -p "${chroot_dir}${bb_dir}" 2>/dev/null
-        mount --bind "$bb_dir" "${chroot_dir}${bb_dir}" 2>/dev/null && mount -o remount,ro,bind "${chroot_dir}${bb_dir}" 2>/dev/null
-        mounted+=("${chroot_dir}${bb_dir}")
+        _cbind "$bb_dir" "${chroot_dir}${bb_dir}" || _bind_failed=true
     fi
 
     # FIX: unmount everything (reverse order — last mounted, first
@@ -4915,6 +5714,12 @@ _sandbox_run_chroot() {
         [ "$still_mounted" = false ] && rm -rf "$chroot_dir" 2>/dev/null
     }
     trap _cleanup_chroot RETURN
+
+    if [ "$_bind_failed" = true ]; then
+        echo "[WARN] chroot sandbox: at least one bind mount could not be verified read-only -- refusing to run the extraction inside a jail with an unconfirmed writable hole in it. Falling back to unsandboxed extraction for this archive." >&2
+        "$@"
+        return
+    fi
 
     chroot "$chroot_dir" /bin/bash -c 'cd "$1"; shift; exec "$@"' _ "$target_dir" "$@"
 }
@@ -5188,7 +5993,9 @@ _archive_batch_yara_check() {
         yfile=$(echo "$yline" | cut -d' ' -f2-)
         rel="${yfile#$extract_dir/}"
         [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
-        if spat=$(_resolve_str_sig "$yrule"); then
+        if _is_builtin_noisy_rule "$yrule"; then
+            SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
+        elif spat=$(_resolve_str_sig "$yrule"); then
             threat "SIG_STRING_MATCH" "$top_archive" "archive_member=${rel}|pattern=${spat:0:50}"
         elif _is_vendor_obfuscation "$yrule" "$yfile"; then
             SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
@@ -5380,7 +6187,21 @@ threat() {
 
     printf 'THREAT:%s|%s|%s\n' "$type" "$file" "$info" >> "$REPORT"
     THREATS_FOUND=$(( THREATS_FOUND + 1 ))
-    if [ -n "$LIVE_REPORT_FILE" ]; then
+    # FIX (real gap reported): this used to unconditionally append EVERY
+    # threat, SUID_SGID included, to the main LIVE_REPORT_FILE — the
+    # split into a separate SUID_REPORT_FILE only happened in
+    # save_report() at the very END of a scan (which truncates and
+    # rewrites the live file cleanly). That left a real gap: anyone
+    # watching the live file DURING a scan (tail -f, or just checking
+    # progress), or a scan that gets interrupted before reaching
+    # save_report(), would still see SUID_SGID lines mixed into the main
+    # file — exactly what this feature exists to avoid. Routed to the
+    # SAME companion file live now, not just at the end.
+    if [ "$type" = "SUID_SGID" ]; then
+        if [ -n "$SUID_REPORT_FILE" ]; then
+            printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$type" "$file" "$info" >> "$SUID_REPORT_FILE" 2>/dev/null
+        fi
+    elif [ -n "$LIVE_REPORT_FILE" ]; then
         # Single printf = single write() syscall = atomic append even with
         # multiple worker processes writing the same file concurrently, as
         # long as the line stays under PIPE_BUF (a few KB) — safe here.
@@ -5490,8 +6311,19 @@ process_hash_batch() {
 # so a single pathological file doesn't cost the whole batch's results and
 # gets identified by name instead of just "the scan is stuck".
 _yara_bisect_slow_batch() {
-    local short_timeout=5
-    [ "$YARA_TIMEOUT_SEC" -lt 20 ] && short_timeout=$(( YARA_TIMEOUT_SEC / 4 ))
+    # FIX (real bug reported — "дуже багато файлів скіпнуло, сканувало
+    # занадто довго"): short_timeout used to be STUCK at a fixed 5s for
+    # any YARA_TIMEOUT_SEC >= 20 — completely ignoring how generously the
+    # person actually configured the main timeout. Compounded by --deep
+    # raising MAX_SCAN_MB to 200MB without touching this at all: a large,
+    # perfectly legitimate file now gets scanned for the first time under
+    # --deep (previously skipped by the size cap), but still only gets
+    # 5 bisect seconds to do it in — the opposite of --deep's "maximum
+    # thoroughness" intent, silently skipping exactly the large files
+    # --deep exists to no longer skip. Now always proportional, same 1/4
+    # ratio regardless of how high YARA_TIMEOUT_SEC is set (so raising
+    # --yara-timeout, or --deep's own bump below, actually helps here too).
+    local short_timeout=$(( YARA_TIMEOUT_SEC / 4 ))
     [ "$short_timeout" -lt 2 ] && short_timeout=2
 
     local yflags2=(-d filename= -d filepath= -d extension= -p 1 -a "$short_timeout")
@@ -5501,7 +6333,14 @@ _yara_bisect_slow_batch() {
     for f in "$@"; do
         t0=$(_now_ms)
         out=$(timeout $(( short_timeout + 2 )) $YARA_CMD "${yflags2[@]}" "$YARA_TARGET" "$f" 2>/dev/null)
+        local frc=$?
         t1=$(_now_ms)
+        if [ "$frc" -ge 128 ]; then
+            # killed again, now on its own: this file is the one that needs
+            # more memory than the ceiling allows. Report it, don't hide it.
+            threat "SCAN_ABORTED" "$f" "yara killed (rc=${frc}) by the RAM ceiling (--max-ram) or the OOM killer|note=file was NOT scanned"
+            continue
+        fi
         if [ $(( (t1 - t0) / 1000 )) -ge "$short_timeout" ]; then
             # This is the (or a) culprit — report it as a diagnostic entry
             # (not necessarily malicious — pathologically slow-to-scan
@@ -5515,7 +6354,9 @@ _yara_bisect_slow_batch() {
         local yrule yfile spat
         yrule=$(echo "$out" | head -1 | awk '{print $1}')
         yfile="$f"
-        if spat=$(_resolve_str_sig "$yrule"); then
+        if _is_builtin_noisy_rule "$yrule"; then
+            SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
+        elif spat=$(_resolve_str_sig "$yrule"); then
             threat "SIG_STRING_MATCH" "$yfile" "pattern=${spat:0:50}"
         elif _is_vendor_obfuscation "$yrule" "$yfile"; then
             SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
@@ -5525,10 +6366,27 @@ _yara_bisect_slow_batch() {
     done
 }
 
+# Worker side of the RAM ceiling: while the monitor's gate is up, don't start
+# another yara process (each loads the full ruleset). Waits at most 20s, and
+# after one timeout stops waiting for 60s — so a ceiling that is simply too
+# low for even one worker slows the scan down instead of stalling it.
+RAM_GATE_SKIP_UNTIL=0
+_ram_gate() {
+    [ -e "$REPORT_DIR/.ram_high" ] || return 0
+    [ "$(date +%s)" -lt "$RAM_GATE_SKIP_UNTIL" ] && return 0
+    local waited=0
+    while [ -e "$REPORT_DIR/.ram_high" ] && [ "$waited" -lt 20 ]; do
+        sleep 1; waited=$(( waited + 1 ))
+    done
+    [ -e "$REPORT_DIR/.ram_high" ] && RAM_GATE_SKIP_UNTIL=$(( $(date +%s) + 60 ))
+    return 0
+}
+
 process_yara_batch() {
     [ $# -eq 0 ] || [ "$HAS_YARA" = false ] || [ "$YARA_CMD" = "none" ] && return
+    _ram_gate
 
-    local yara_out yara_flags=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC")
+    local yara_out yrc yara_flags=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC")
     # A compiled ruleset (.yarc) MUST be loaded with -C, or yara tries to
     # parse the binary as rule *source* and fails outright.
     case "$YARA_TARGET" in
@@ -5557,8 +6415,18 @@ process_yara_batch() {
         # SIGKILL at the OS level) as a HARD guarantee that doesn't depend
         # on yara's internal timeout logic working correctly at all.
         yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        yrc=$?
         local t1; t1=$(_now_ms)
         rm -f "$listfile"
+
+        # yara died from a signal (>= 128; a plain timeout is 124): killed by
+        # the RAM limiter or by the kernel's OOM killer. Its output is empty
+        # and would read as "clean" — instead rescan this batch one file at a
+        # time, which also pins down the file responsible.
+        if [ "$yrc" -ge 128 ]; then
+            _yara_bisect_slow_batch "$@"
+            return
+        fi
 
         # FIX (real hang reported): a batch call that hits -a's timeout
         # aborts the WHOLE --scan-list operation, losing results for every
@@ -5605,7 +6473,9 @@ process_yara_batch() {
             local yrule; yrule=$(echo "$yline" | awk '{print $1}')
             local yfile; yfile=$(echo "$yline" | cut -d' ' -f2-)
             local spat
-            if spat=$(_resolve_str_sig "$yrule"); then
+            if _is_builtin_noisy_rule "$yrule"; then
+                SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
+            elif spat=$(_resolve_str_sig "$yrule"); then
                 threat "SIG_STRING_MATCH" "$yfile" "pattern=${spat:0:50}"
             elif _is_vendor_obfuscation "$yrule" "$yfile"; then
                 SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
@@ -5907,6 +6777,15 @@ run_scan_loop() {
                     ;;
             esac
 
+            if [ "$skip_deep" = true ] && [ "$HAS_YARA" = true ]; then
+                if [ "$DEEP_MODE" = "true" ]; then
+                    skip_deep=false
+                else
+                    BATCH_IMG+=("$file")
+                    [ "${#BATCH_IMG[@]}" -ge "$BATCH_SIZE" ] && _flush_image_batch
+                fi
+            fi
+
             if [ "$skip_deep" = false ] && [ "$HAS_YARA" = true ]; then
                 BATCH_YARA+=("$file")
                 YARA_BATCH_CNT=$(( YARA_BATCH_CNT + 1 ))
@@ -5956,6 +6835,7 @@ run_scan_loop() {
     [ "$SHA_BATCH_CNT" -gt 0 ] && _timed_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
     [ "$SHA1_BATCH_CNT" -gt 0 ] && _timed_hash_batch "sha1" "$SIG_DIR/sha1.tsv" "${BATCH_SHA1[@]}"
     [ "$MD5_BATCH_CNT" -gt 0 ] && _timed_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
+    _flush_image_batch
     [ "$YARA_BATCH_CNT" -gt 0 ] && _timed_yara_batch "${BATCH_YARA[@]}"
     [ "$HEUR_BATCH_CNT" -gt 0 ] && _timed_heur_batch "${BATCH_HEUR[@]}"
     [ "$PE_BATCH_CNT" -gt 0 ] && _timed_pe_batch "${BATCH_PE[@]}"
