@@ -27,3 +27,40 @@ rule=WEBSHELL_PHP_OBFUSC_3.*/vendor/laravel/framework/src/Illuminate/Cache/PhpRe
 rule=WEBSHELL_PHP_Dynamic_Big.*vendor/spatie/laravel-ignition/src/Recorders/DumpRecorder/MultiDumpHandler\.php$
 rule=php_malfunctions.*/ace/mode-php
 rule=overwrite_globals_hack.*/engine/classes/min/lib/JSMinify\.php$
+
+# ===== Orphus: noise found on real scans (generic YARA/ClamAV indicators on system files) =====
+# Format reminder: the matched string is  TYPE|info|PATH  (info = rule=NAME ...)
+ 
+# --- Generic string/API indicator rules (Yara-Rules "capabilities"/utils): not verdicts ---
+rule=(IsSuspicious|possible_includes_base64_packed_functions|ldpreload|Borland|cred_ff|network_smtp_raw|spreading_file|win_files_operation|network_tcp_listen|network_irc|network_dyndns|network_ssl|network_udp_sock|win_mutex|win_token|cred_local|hijack_network|escalate_priv|lsadump|inject_thread|function_through_object|multiple_versions)[|]
+ 
+# --- PE-feature and compiler-ID helper rules (fire on ANY PE: kernel EFI stub, nmap exe, pip launchers) ---
+rule=(HasRichSignature|IsPE32|IsPE64|IsConsole|IsWindowsGUI|IsPacked|HasOverlay|HasDebugData|HasDigitalSignature|ImportTableIsBad|HasModified_DOS_Message|VC8_Microsoft_Corporation|Microsoft_Visual_Cpp_8|Microsoft_Visual_Cpp_80_DLL|Visual_Cpp_2008_Release_Microsoft|VM_Generic_Detection|Str_Win32_Wininet_Library)[|]
+ 
+# --- maldoc heuristics firing on non-documents ---
+rule=(maldoc_find_kernel32_base_method_1|maldoc_indirect_function_call_3)[|]
+ 
+# --- ClamAV potentially-unwanted-app signatures (ClamAV itself ignores them unless --detect-pua) ---
+rule=s_PUA_
+ 
+# --- ClamAV signatures (PE etc.) on files that are not malware ---
+rule=s_[A-Za-z0-9_]*[|][^|]*/boot/vmlinuz
+rule=s_[A-Za-z0-9_]*[|][^|]*/usr/libexec/fwupd/efi/
+rule=s_[A-Za-z0-9_]*[|][^|]*/var/lib/containerd/
+rule=s_Xls_Macro_SYLKAgent_[A-Za-z0-9_]*[|][^|]*[.](js|map|htm)$
+rule=s_(Pdf_Exploit|Html_Spyware)_[A-Za-z0-9_]*[|][^|]*/usr/local/mgr5/
+rule=s_Java_Malware_[A-Za-z0-9_]*[|][^|]*/usr/local/(bin/wp|mgr5/)
+ 
+# --- nmap ships exploit/shell strings and a Windows psexec service exe by design ---
+[|][^|]*/usr/share/nmap/(scripts|nselib)/
+ 
+# --- single known false positives ---
+rule=LinuxHacktool_eyes_screen[|][^|]*/usr/bin/screen$
+rule=SharedStrings[|][^|]*/libmemcached
+rule=Bolonyokte[|][^|]*/usr/local/mgr5/
+rule=overwrite_globals_hack[|][^|]*/engine/classes/min/lib/JSMinify[.]php$
+rule=php_malfunctions[|][^|]*(/ace/mode-|/vim/vim[0-9]+/autoload/phpcomplete)
+ 
+# --- not executable content: database files and web-server access logs ---
+[|][^|]*/var/lib/mysql[^|]*[.](ibd|MYI|MYD|frm)$
+[|][^|]*/var/www/(httpd-logs|www-root/data/logs)/
