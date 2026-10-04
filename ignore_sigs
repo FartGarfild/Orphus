@@ -25,3 +25,5 @@ rule=WEBSHELL_PHP_Generic_Callback.*/mmtrade/filemanager/elFinderConnector\.clas
 rule=WEBSHELL_PHP_Dynamic_Big.*/vendor/clue/stream-filter/tests/FunTest\.php
 rule=WEBSHELL_PHP_OBFUSC_3.*/vendor/laravel/framework/src/Illuminate/Cache/PhpRedisLock\.php
 rule=WEBSHELL_PHP_Dynamic_Big.*vendor/spatie/laravel-ignition/src/Recorders/DumpRecorder/MultiDumpHandler\.php$
+rule=php_malfunctions.*/ace/mode-php
+rule=overwrite_globals_hack.*/engine/classes/min/lib/JSMinify\.php$
