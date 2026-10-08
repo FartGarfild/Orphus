@@ -22,7 +22,11 @@
 #   ./av_scan.sh [OPTIONS]
 #
 # Options:
-#   -u, --update            Update signatures and EXIT (no auto-scan after)
+#   -u, --update            Update signatures and EXIT (no auto-scan after).
+#                          Add --packs hosting,server,all to build several
+#                          YARA/ClamAV packs in one go (see --packs below);
+#                          without --packs only the profile of --yara-rules
+#                          (default: all) is built.
 #   -r, --max-ram MB        Max RAM limit in megabytes (default: 500). Enforced:
 #                            at start the worker count is cut to what fits; at
 #                            runtime, from 90% of the ceiling new yara starts
@@ -80,7 +84,23 @@
 #                            (hosting is the smallest; RAM Guard sizes the
 #                            worker count from the real rules.yarc), so heavier
 #                            profiles need a higher --max-ram. Changing the
-#                            profile recompiles.
+#                            profile recompiles ONLY ONCE: every profile is
+#                            kept as its own pack in signatures/.cache/packs/<id>/
+#                            and a scan simply picks the matching one.
+#   --packs LIST             Pack = one prebuilt YARA/ClamAV set (hosting, server,
+#                            all, or a category list).
+#                            With -u:  build all of them in one go, e.g.
+#                                ./av.sh -u --packs hosting,server,all
+#                              (the whole signatures/.cache can then be shipped as
+#                              ONE archive).
+#                            Without -u: pick the pack to scan with, exactly like
+#                              --yara-rules, e.g. ./av.sh -d /home --packs hosting
+#                              (a pack that was not built yet is built on first use).
+#   --clam-groups LIST       Which ClamAV target groups go into the pack:
+#                            any script elf doc pe other. Default follows the
+#                            profile: hosting = any,script,elf; server adds doc;
+#                            all (and legacy) adds pe,other — i.e. the Windows PE
+#                            signatures only with `all`/legacy or on request.
 #   --yara-all               Load EVERY rule file (= --yara-rules all) and also
 #                            bypass the built-in file exclusions, whatever the
 #                            RAM cost. Your own yara_exclude still applies.
@@ -113,7 +133,7 @@
 #   --archive-max-files N     Only scan the first N files inside one
 #                            archive (default: 2000)
 #   --yara-timeout SECONDS    Abort a single yara call after this long
-#                            (default: 30) — protects against a scan
+#                            (default: 300; --deep: 600) — protects against a scan
 #                            hanging indefinitely on a pathological file.
 #                            On a timeout, that batch is retried one file
 #                            at a time with a short timeout each: fast
@@ -213,6 +233,33 @@
 #                            from your host's rescue/recovery boot (every
 #                            major provider offers one — the practical
 #                            cloud-VPS equivalent of a LiveCD).
+#                            ALSO compares every boot/vmlinuz-* with a list of
+#                            known kernel builds (signatures/kernel_refs/*.tsv,
+#                            one file per distribution: ubuntu debian alma rocky
+#                            centos; all produced by ONE script,
+#                            tools/gen_kernel_refs.py, from the distributions' own
+#                            packages). This needs no dpkg, so it also works from
+#                            a rescue system that is not Debian/Ubuntu, and it
+#                            does not trust the checksums stored on the inspected
+#                            disk. Verdicts: OK / MISMATCH (known name, wrong
+#                            content) / RENAMED / UNKNOWN (not in the list).
+#   --audit                   Compromise audit instead of a file scan (own module,
+#                            read-only, takes seconds). Looks at what the file scanner
+#                            cannot see: effective sshd settings (PermitRootLogin /
+#                            PasswordAuthentication, first value wins across Include
+#                            files), UID-0 and empty-password accounts, authorized_keys,
+#                            ld.so.preload, cron/systemd/rc.local/shell-startup persistence,
+#                            executables and ELF files in /tmp /var/tmp /dev/shm, miner and
+#                            brute-force tool names, shell history (wiped / suspicious),
+#                            and the sshd logs: login after many failures (password
+#                            guessed), failed logins from 127.0.0.1 (brute force launched
+#                            from this host), logins from different IPs seconds apart,
+#                            root password logins, logins missing from wtmp. Best with
+#                            --offline-root. -o FILE saves the report. Exit code:
+#                            0 nothing, 1 only MEDIUM, 2 at least one HIGH.
+#   --audit-since DATE        Same, and also list system files (etc, root, usr/local, opt,
+#                            cron, systemd, tmp, bin dirs) changed since DATE (YYYY-MM-DD),
+#                            e.g. the day the first suspicious login happened.
 #   --offline-root PATH       Point every check (including -K, and the
 #                            normal file scan via -d) at a MOUNTED, NOT
 #                            BOOTED disk instead of the live filesystem —
@@ -291,6 +338,131 @@
 #                            debug or not — that's the one case they're
 #                            actually needed for.
 #
+# Examples — the usual workflow, in order:
+#
+#   1) One-time install (needs network + a C toolchain):
+#        ./av.sh --setup                     build bin/yara, bin/yarac, grep, bash
+#                                            (and fetch busybox). Binaries are
+#                                            downloaded/built ONLY by --setup,
+#                                            never during a scan.
+#
+#   2) Get and compile signatures (separate action, no scan afterwards):
+#        ./av.sh -u                          update; builds the default pack (all)
+#        ./av.sh -u --packs hosting,server,all
+#                                            update and build several packs at
+#                                            once. Pack = a prebuilt YARA/ClamAV
+#                                            set kept in signatures/.cache/packs/.
+#                                            Ship that .cache as one archive and
+#                                            nothing has to be compiled on the
+#                                            target machine.
+#        ./av.sh -u --packs hosting --clam-groups any,script,elf
+#                                            same, with the ClamAV groups chosen
+#                                            by hand (leaves Windows PE out)
+#
+#   3) Scan (the pack is chosen per scan, nothing is recompiled if it exists):
+#        ./av.sh -d /home                    scan /home with the default pack (all)
+#        ./av.sh -d /home --packs hosting    light pack for PHP/CMS hosting
+#                                            (= --yara-rules hosting)
+#        ./av.sh -d /var/www --packs server  web + Linux + documents, no Windows PE
+#        ./av.sh -d /mnt/win --packs all     everything, incl. Windows signatures
+#        ./av.sh -d /home -o report.log      also write the report to a file
+#        ./av.sh -d /home -X /home/backup    skip a directory (repeat -X for more)
+#        ./av.sh -d /home -j 4 -r 1000       4 workers, 1000 MB RAM ceiling
+#                                            (a big ruleset is shared through
+#                                            few yara processes with threads)
+#        ./av.sh -d / --deep -o audit.log    maximum scrutiny, ignores ignore_sigs
+#        ./av.sh -d /home -A                 look inside archives too
+#        ./av.sh -d /home -q                 move detected files to quarantine/
+#
+#   4) Other modes:
+#        ./av.sh -w -d /home                 real-time watch after the base scan
+#        ./av.sh -P                          check running processes only
+#        ./av.sh --offline-root /mnt/disk -K -d /mnt/disk
+#                                            rescue-mode audit of a mounted disk
+#        ./av.sh --offline-root /mnt/disk --audit
+#                                            was the host broken into? sshd settings,
+#                                            accounts/keys, persistence, auth logs
+#        ./av.sh --offline-root /mnt/disk --audit-since 2026-09-29 -o audit.txt
+#                                            same + files changed since that day, saved
+#        ./av.sh --check-deps                what is bundled / missing
+#
+#   5) Audit — "was this host broken into?" (--audit, separate from file scans):
+#        # boot the rescue system, mount the suspect disk read-only at /mnt, then:
+#        ./av.sh --offline-root /mnt --audit
+#                                            everything below, in seconds
+#        ./av.sh --offline-root /mnt --audit-since 2026-09-29 -o /root/audit.txt
+#                                            + system files changed since that date
+#                                            (use the date of the first suspicious
+#                                            login); the report is saved in plain text
+#        ./av.sh --audit                     the running system (a rootkit can lie to it)
+#      Run it BEFORE or next to a file scan: an attacker who guessed the root password
+#      needs no malware, so a clean file scan proves nothing about this.
+#      Exit code: 0 nothing found, 1 only MEDIUM, 2 at least one HIGH.
+#
+#      How to read the output. Severity:
+#        [!] HIGH   strong indicator: act on it (rotate secrets, close SSH password
+#                   login, rebuild if in doubt)
+#        [?] MEDIUM needs a human look: are these logins / keys / jobs really yours?
+#            (plain) context for the report (lists of logins, users, ports)
+#      Tags (AUDIT_<TAG>), grouped by check:
+#        sshd settings (first value in sshd_config / Include files wins)
+#          SSH_ROOT_PASSWORD  HIGH  root may log in with a PASSWORD (PermitRootLogin yes
+#                                   + PasswordAuthentication not "no"): brute-forceable
+#          SSH_ROOT_LOGIN     MED   PermitRootLogin yes, but password login is off (keys)
+#          SSH_PASSWORD       info  password login is on (root is not allowed by password)
+#          SSH_OK             info  root by key only and no password login
+#          SSH_OVERRIDDEN     info  a LATER line contradicts the effective value and is
+#                                   ignored ("I set it to no, but it still works")
+#          SSH_EMPTY_PW       HIGH  PermitEmptyPasswords yes
+#          SSH_KEYS_CFG       MED   non-default AuthorizedKeysCommand / AuthorizedKeysFile
+#          SSH_PORT           info  the port sshd listens on
+#        accounts and keys
+#          UID0               HIGH  a second account with UID 0 (hidden root)
+#          EMPTY_PASSWORD     HIGH  account with an empty password in /etc/shadow
+#          SYSTEM_SHELL       MED   service account (e.g. www-data) with a login shell
+#          USERS / SUDO_NOPASSWD  info  login-capable users / sudo rules without password
+#          AUTHORIZED_KEYS    MED   (root) / info (others): key count, mtime, comments —
+#                                   check every key is known
+#          KEY_OPTIONS        MED   a key with options (forced command, restrictions)
+#          LD_PRELOAD         HIGH  /etc/ld.so.preload is not empty (userland rootkit)
+#        persistence
+#          CRONTAB            info  contents of user crontabs
+#          CRON_SUSPICIOUS    MED   cron line with curl|sh, /dev/tcp, base64 -d, /tmp path...
+#          SYSTEMD_SUSPICIOUS MED   a unit ExecStart-like line with the same patterns
+#          STARTUP_SUSPICIOUS MED   rc.local / profile / .bashrc with the same patterns
+#          DOCKER_TCP         HIGH  the Docker API listens on TCP (remote root)
+#        files and history
+#          TMP_ELF            HIGH  ELF binary in /dev/shm or with a hidden name in a tmp
+#                                   dir; MED for an ELF in plain /tmp (often an installer)
+#          TMP_EXEC           MED   executable file in /dev/shm; info in /tmp, /var/tmp
+#          TOOL_NAME          MED   file named like a miner / brute-forcer / rootkit
+#          HISTORY_WIPED / HISTORY_EMPTY  MED  shell history is /dev/null or empty
+#          HISTORY_SUSPICIOUS MED   history line like wget ... | bash, nc -e, hydra...
+#        sshd logs (auth.log*, secure*, also .gz)
+#          LOGIN_AFTER_BRUTEFORCE HIGH  successful login from an IP that failed >=3 times
+#                                   before: the password was probably guessed
+#          LOCAL_BRUTEFORCE   HIGH  failed logins FROM 127.0.0.1: a brute-force tool ran
+#                                   on this host, or an SSH tunnel goes through it
+#          LOGIN_HANDOVER     MED   logins from different IPs within 60 s (one actor, or a
+#                                   found password passed to another machine)
+#          ROOT_PASSWORD_LOGINS MED root logged in BY PASSWORD from N distinct IPs
+#          LOGIN_NOT_IN_WTMP  MED   in auth.log but not in wtmp: a login without a
+#                                   terminal (remote command, tunnel, script), or wtmp
+#                                   was edited
+#          ACCEPTED           info  every successful login: user, method, IP, count,
+#                                   first/last time, failures before the first success
+#          AUTHLOG            info  which log files were parsed / how many failures
+#          CHANGED            info  files changed since --audit-since DATE
+#      These are indicators, not proof. Typical chain that means "break-in": SSH_ROOT_PASSWORD
+#      + LOGIN_AFTER_BRUTEFORCE (+ LOGIN_HANDOVER, LOCAL_BRUTEFORCE). Nothing found does not
+#      prove a clean host (processes in memory and deleted tools are invisible on disk).
+#
+#   Which pack for what: hosting = any + script + ELF ClamAV sigs and the
+#   webshell/webapp/linux/exploit YARA rules (smallest RAM); server adds
+#   documents and the malware/generic/docs YARA rules; all adds Windows PE and
+#   the legacy rules. If a scan reports a RAM ceiling warning, pick a lighter
+#   pack instead of raising the ceiling.
+#
 # File layout:
 #   1. GLOBALS         — all script variables, defined once here
 #   2. MODULE: platform / cpu
@@ -356,7 +528,7 @@ export LC_ALL=C
 # 1. GLOBALS — all script variables defined once here, before any code uses
 #    them. init_*/detect_* functions and parse_args() fill in real values.
 # ============================================================================
-VERSION="0.3.2"
+VERSION="0.3.3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Re-exec into our OWN bundled bash (see build_bash_from_source /
@@ -487,7 +659,9 @@ SANDBOX_MODE="auto"    # --sandbox-mode auto|bwrap|unshare|chroot|simple|none
 SANDBOX_USER="nobody"
 SANDBOX_MEM_KB=1048576  # 1GB, simple mode only
 SANDBOX_CPU_SEC=60
-YARA_TIMEOUT_SEC=30    # --yara-timeout: abort a yara call after this many
+YARA_TIMEOUT_SEC=300   # --yara-timeout: abort a yara call after this many
+PACKS_SPEC=""             # --packs: with -u, build these YARA/ClamAV packs (hosting,server,all,...)
+CLAM_GROUPS_ARG=""        # --clam-groups: override which ClamAV target groups go into the pack
 YARA_RULES_SPEC="all"        # --yara-rules (default: everything; "hosting" is
                         # the lighter opt-in): which community YARA rule
                         # categories to compile (see _yara_category)
@@ -854,8 +1028,20 @@ verify_busybox_binary() {
     if [ "$OS" = "macos" ]; then sz=$(stat -f '%z' "$c" 2>/dev/null)
     else sz=$(stat -c '%s' "$c" 2>/dev/null); fi
     { [ -n "$sz" ] && [ "$sz" -ge 400000 ] && [ "$sz" -le 3000000 ]; } || return 1
-    "$c" --help 2>&1 | head -1 | grep -qi "busybox" || return 1
-    return 0
+    # FIX (root cause of the "busybox randomly disappears" report, found by
+    # reproducing it): the old `"$c" --help 2>&1 | head -1 | grep -qi busybox`
+    # runs under `set -o pipefail`. `head -1` exits after the first line while
+    # busybox is still writing the rest of its (multi-KB) help text -> SIGPIPE
+    # (status 141) -> the whole pipeline "fails" although the output was right.
+    # Measured with a stand-in binary: ~0.4% spurious failures on an idle box,
+    # ~7% under CPU load (e.g. leftover workers after Ctrl+C). No pipe now:
+    # capture the output first, then match it.
+    local out
+    out=$("$c" --help 2>&1) || true
+    case "$out" in
+        *[Bb]usy[Bb]ox*) return 0 ;;
+    esac
+    return 1
 }
 
 find_local_busybox() {
@@ -892,13 +1078,23 @@ find_local_busybox() {
 
 download_busybox() {
     local url="$1" dest="$SCRIPT_DIR/bin/busybox"
+    # FIX: download into a TEMP file and only move it into place after it
+    # verifies. The old code wrote straight to $dest: wget -O truncates the
+    # target before connecting and net_fetch()/this function did `rm -f
+    # "$dest"` on any failure — so a spurious verify failure followed by an
+    # unreachable network DESTROYED a perfectly good bundled busybox.
+    local tmp="$dest.new.$$"
     mkdir -p "$SCRIPT_DIR/bin"
     echo -e "${C}[*] BusyBox not found locally -> auto-downloading (~1MB)...${Z}"
-    if net_fetch "$url" "$dest" 15 "" 10 && verify_busybox_binary "$dest" 2>/dev/null; then
-        :
+    rm -f "$tmp" 2>/dev/null
+    net_fetch "$url" "$tmp" 15 "" 10 >/dev/null 2>&1
+    chmod +x "$tmp" 2>/dev/null
+    if verify_busybox_binary "$tmp"; then
+        mv -f "$tmp" "$dest" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; echo -e "${R}[FAIL] cannot place busybox at $dest${Z}"; return 1; }
     else
-        chmod +x "$dest" 2>/dev/null
-        verify_busybox_binary "$dest" || { rm -f "$dest" 2>/dev/null; echo -e "${R}[FAIL] BusyBox download/verify failed${Z}"; return 1; }
+        rm -f "$tmp" 2>/dev/null
+        echo -e "${R}[FAIL] BusyBox download/verify failed (existing $dest left untouched)${Z}"
+        return 1
     fi
     chmod +x "$dest" 2>/dev/null
     echo -e "${G}[OK] busybox saved: $dest${Z}"
@@ -919,6 +1115,14 @@ ensure_busybox() {
 
     if [ "$OS" = "macos" ]; then
         echo -e "${Y}[INFO] macOS: no official static busybox builds -> system tools${Z}"
+        return 1
+    fi
+
+    # Binaries are fetched ONLY by an explicit `--setup`. A scan must never
+    # download or overwrite executables on its own (supply-chain risk, and a
+    # failed fetch must not be able to damage the installed toolchain).
+    if [ "${AV_SETUP_MODE:-0}" != 1 ]; then
+        echo -e "${Y}[INFO] Auto-download is disabled during scans -> run '$0 --setup' to fetch busybox. Using system tools.${Z}"
         return 1
     fi
 
@@ -1478,7 +1682,7 @@ run_self_setup() {
         echo ""
         echo "[*] busybox not bundled yet — attempting the same auto-download used at scan time..."
         BUSYBOX_BIN=""
-        ensure_busybox
+        AV_SETUP_MODE=1 ensure_busybox
     fi
 
     echo ""
@@ -1508,6 +1712,10 @@ parse_args() {
             --archive-max-files)      ARCHIVE_MAX_FILES="$2"; shift 2 ;;
             --yara-timeout)           YARA_TIMEOUT_SEC="$2"; YARA_TIMEOUT_SEC_EXPLICIT=1; shift 2 ;;
             --yara-rules)             _yara_validate_spec "$2" || exit 1; YARA_RULES_SPEC="$2"; shift 2 ;;
+            --packs)                  [ $# -ge 2 ] || { echo "[FAIL] --packs needs a value" >&2; exit 1; }
+                                      PACKS_SPEC="$2"; _yara_validate_spec "$2" || exit 1; shift 2 ;;
+            --clam-groups)            [ $# -ge 2 ] || { echo "[FAIL] --clam-groups needs a value" >&2; exit 1; }
+                                      _clam_validate_groups "$2" || exit 1; CLAM_GROUPS_ARG="$2"; shift 2 ;;
             --yara-all)               YARA_ALL=true; shift ;;
             --sandbox-mode)
                 # FIX (real bug reported): "$2" used to be accepted
@@ -1529,6 +1737,8 @@ parse_args() {
             -P|--scan-processes) SCAN_PROCESSES=true; shift ;;
             -K|--check-kernel)   CHECK_KERNEL=true; shift ;;
             --offline-root)      OFFLINE_ROOT="$2"; shift 2 ;;
+            --audit)             AUDIT_MODE=true; shift ;;
+            --audit-since)       AUDIT_MODE=true; AUDIT_SINCE="$2"; shift 2 ;;
             --sig-in-ram)        SIG_IN_RAM=true; shift ;;
             --deep|--paranoid)   SUID_VERIFY_MODE=true; SCAN_ARCHIVES=true; DEEP_MODE=true
                                  # Real gap found: the default 10MB deep-
@@ -1552,7 +1762,7 @@ parse_args() {
                                  # per-file timeout is now proportional to
                                  # this value, so raising it here actually
                                  # helps there too).
-                                 [ -z "$YARA_TIMEOUT_SEC_EXPLICIT" ] && YARA_TIMEOUT_SEC=120
+                                 [ -z "$YARA_TIMEOUT_SEC_EXPLICIT" ] && YARA_TIMEOUT_SEC=600
                                  shift ;;
             -L|--long-time)  LONG_TIME_MODE=true; shift ;;
             --long-time-threshold)    LONG_TIME_THRESHOLD_SEC="$2"; shift 2 ;;
@@ -1643,10 +1853,37 @@ _yara_ram_cap() {
     fi
     max_safe=$(( MAX_RAM_MB / est ))
     [ "$max_safe" -lt 1 ] && max_safe=1
-    if [ "$WORKERS" -gt "$max_safe" ]; then
-        echo -e "${Y}[WARN] YARA RAM estimate (~${est} MB per yara process): reducing workers $WORKERS -> $max_safe${Z}"
-        WORKERS=$max_safe
+    # Every yara PROCESS holds its own full copy of the ruleset, but the
+    # THREADS inside one process (-p N, also with --scan-list) share it.
+    # Measured (4.5.4, 150k hex rules): 8 processes 895 MB RSS vs one process
+    # with 8 scanning threads 112 MB, same work. So for a heavy ruleset the
+    # parallelism moves from "N processes" to "few processes x several
+    # threads": workers (hashing, heuristics, PE parsing) stay at full count,
+    # only the number of CONCURRENT yara processes is limited (YARA_SLOTS).
+    local cpus; cpus=$(cpu_count)
+    YARA_SLOTS=$WORKERS; YARA_THREADS=1
+    if [ "$est" -ge "${YARA_HEAVY_MB:-300}" ] && [ "$WORKERS" -gt 1 ]; then
+        local per=${AV_YARA_THREADS:-4}
+        YARA_SLOTS=$(( (WORKERS + per - 1) / per ))
+        [ "$YARA_SLOTS" -gt "$max_safe" ] && YARA_SLOTS=$max_safe
+        [ "$YARA_SLOTS" -lt 1 ] && YARA_SLOTS=1
+        YARA_THREADS=$(( (cpus + YARA_SLOTS - 1) / YARA_SLOTS ))
+        [ "$YARA_THREADS" -lt 1 ] && YARA_THREADS=1
+        [ "$YARA_THREADS" -gt 32 ] && YARA_THREADS=32
+        echo -e "${Y}[INFO] Heavy YARA set (~${est} MB per yara process): at most ${YARA_SLOTS} concurrent yara x ${YARA_THREADS} threads (~$(( YARA_SLOTS * est )) MB) instead of ${WORKERS} processes (~$(( WORKERS * est )) MB). Workers stay at ${WORKERS}.${Z}"
+        [ "$est" -gt "$MAX_RAM_MB" ] && echo -e "${R}[WARN] One copy of the ruleset (~${est} MB) alone exceeds the ${MAX_RAM_MB} MB ceiling — threads cannot fix that; use a smaller --yara-rules profile or raise the ceiling${Z}"
+    elif [ "$WORKERS" -gt "$max_safe" ]; then
+        # Light set but a tight RAM ceiling: keep the workers, cap the number
+        # of concurrent yara processes at what fits, and give each of them
+        # the remaining CPU as threads (same ruleset copy, more cores used).
+        YARA_SLOTS=$max_safe
+        YARA_THREADS=$(( (cpus + YARA_SLOTS - 1) / YARA_SLOTS ))
+        [ "$YARA_THREADS" -lt 1 ] && YARA_THREADS=1
+        [ "$YARA_THREADS" -gt 32 ] && YARA_THREADS=32
+        echo -e "${Y}[INFO] YARA RAM estimate (~${est} MB per yara process): ${YARA_SLOTS} concurrent yara x ${YARA_THREADS} threads fit into ${MAX_RAM_MB} MB; workers stay at ${WORKERS}${Z}"
+        [ "$est" -gt "$MAX_RAM_MB" ] && echo -e "${R}[WARN] One copy of the ruleset (~${est} MB) alone exceeds the ${MAX_RAM_MB} MB ceiling — threads cannot fix that; use a smaller --yara-rules profile or raise the ceiling${Z}"
     fi
+    export YARA_SLOTS YARA_THREADS
 }
 
 init_workers() {
@@ -1674,7 +1911,7 @@ init_workers() {
     # from the profile table. Re-checked against the REAL compiled ruleset
     # right after compile_signatures (see main) — that one includes the
     # ClamAV-converted rules, which this early pass can't see on a first run.
-    _yara_ram_cap "$SIGNATURES/.cache/yara/rules.yarc"
+    _yara_ram_cap "$SIGNATURES/.cache/packs/$(_yara_pack_id)/rules.yarc"
 
     # Capture the person's ORIGINAL --no-ram preference for archive
     # extraction BEFORE the low-RAM-profile auto-tuning below can
@@ -2341,6 +2578,47 @@ _yara_expand_profile() {
     YARA_CATS=$(printf '%s\n' $cats | sort -u | tr '\n' ' ')
 }
 
+# ClamAV signatures carry a TargetType (the kind of file they apply to). They
+# are split into groups so a pack can leave out what a Linux hosting box does
+# not need (mostly Windows PE signatures):
+#   any    TargetType 0 (any file)           script 3 (HTML) + 7 (ASCII/scripts)
+#   elf    6 (ELF)                           doc    2 (OLE2) 4 (mail) 10 (PDF) 11 12
+#   pe     1 (PE)                            other  5 (graphics) 9 (Mach-O) and the rest
+_clam_validate_groups() {
+    local g
+    for g in $(printf '%s' "$1" | tr ',' ' '); do
+        case "$g" in any|script|elf|doc|pe|other) ;;
+            *) echo "[FAIL] --clam-groups: unknown group '$g' (any|script|elf|doc|pe|other)" >&2; return 1 ;;
+        esac
+    done
+}
+
+# Sets CLAM_GROUPS (space separated) for the current profile.
+_clam_groups() {
+    [ -z "$YARA_CATS" ] && _yara_expand_profile
+    if [ -n "$CLAM_GROUPS_ARG" ]; then
+        CLAM_GROUPS=$(printf '%s\n' $(printf '%s' "$CLAM_GROUPS_ARG" | tr ',' ' ') | sort -u | tr '\n' ' ' | sed 's/ *$//')
+        return 0
+    fi
+    local g="any script" c
+    for c in $YARA_CATS; do
+        case "$c" in
+            linux)  g="$g elf" ;;
+            docs)   g="$g doc" ;;
+            legacy) g="$g elf doc pe other" ;;
+        esac
+    done
+    CLAM_GROUPS=$(printf '%s\n' $g | sort -u | tr '\n' ' ' | sed 's/ *$//')
+}
+
+# Name of the pack (= cache sub-directory) for the current profile.
+_yara_pack_id() {
+    local id
+    if [ "$YARA_ALL" = true ]; then id="allx"; else id=$(printf '%s' "$YARA_RULES_SPEC" | tr -c 'a-zA-Z0-9\n' '_'); fi
+    [ -n "$CLAM_GROUPS_ARG" ] && id="${id}_g_$(printf '%s' "$CLAM_GROUPS_ARG" | tr -c 'a-zA-Z0-9\n' '_')"
+    printf '%s' "$id"
+}
+
 # Part of the signature-cache key: switching profile must recompile.
 _yara_profile_key() {
     [ -z "$YARA_CATS" ] && _yara_expand_profile
@@ -2395,20 +2673,23 @@ _yara_file_excluded() {
 # so a single malformed rule can't cost the whole ClamAV set.
 # Uses $YARAC_BIN, yara_extvars, yara_ns_args, out_dir (caller's scope).
 _yara_compile_ns() {
-    local gen="$1" try cerr rc=1 bad nbad total=0
+    local try cerr rc=1 bad nbad total=0 gf fn ydir="$out_dir/yara"
     for try in 1 2 3; do
         cerr=$("$YARAC_BIN" "${yara_extvars[@]}" "${yara_ns_args[@]}" "$out_dir/yara/rules.yarc" 2>&1 >/dev/null)
         rc=$?
         [ "$rc" -eq 0 ] && break
-        [ -z "$gen" ] && break
-        bad=$(printf '%s\n' "$cerr" | grep '^error' | grep -F 'generated_ndb_ldb.yar(' \
-              | bb sed -E 's/.*generated_ndb_ldb\.yar\(([0-9]+)\).*/\1/' | bb sort -un)
+        [ -z "$(bb find "$ydir" -maxdepth 1 -name 'generated_ndb_ldb.*.yar' 2>/dev/null | head -1)" ] && break
+        bad=$(printf '%s\n' "$cerr" | grep '^error' | grep -E 'generated_ndb_ldb\.[a-z]+\.yar\([0-9]+\)' \
+              | bb sed -E 's/.*(generated_ndb_ldb\.[a-z]+\.yar)\(([0-9]+)\).*/\1 \2/' | bb sort -u)
         [ -z "$bad" ] && break
         nbad=$(printf '%s\n' "$bad" | bb wc -l | tr -d ' ')
         total=$((total + nbad))
-        printf '%s\n' "$bad" > "$gen.bad"
-        bb awk 'NR==FNR { d[$1]=1; next } !(FNR in d)' "$gen.bad" "$gen" > "$gen.tmp" && mv -f "$gen.tmp" "$gen"
-        rm -f "$gen.bad" "$gen.tmp"
+        for fn in $(printf '%s\n' "$bad" | bb awk '{print $1}' | bb sort -u); do
+            gf="$ydir/$fn"; [ -f "$gf" ] || continue
+            printf '%s\n' "$bad" | bb awk -v f="$fn" '$1 == f { print $2 }' > "$gf.bad"
+            bb awk 'NR==FNR { d[$1]=1; next } !(FNR in d)' "$gf.bad" "$gf" > "$gf.tmp" && mv -f "$gf.tmp" "$gf"
+            rm -f "$gf.bad" "$gf.tmp"
+        done
     done
     [ "$total" -gt 0 ] && echo -e "  ${Y}[WARN] ClamAV->YARA: dropped ${total} generated rule(s) that yarac rejected (the rest are kept)${Z}"
     [ "$rc" -eq 0 ]
@@ -2460,9 +2741,20 @@ compile_signatures() {
     # effect for anyone reusing an existing signatures/ directory. Now the
     # cache is also invalidated whenever VERSION doesn't match what it was
     # compiled with.
-    local cache_stamp="$VERSION|$(_yara_profile_key)"
-    local cached_version=""
+    # The hash/string artifacts do not depend on the YARA profile, so the base
+    # cache is stamped with VERSION only. Everything profile-specific (the
+    # compiled YARA set, including the ClamAV-converted rules of the chosen
+    # target groups) lives in its own PACK: .cache/packs/<id>/. Several packs
+    # can sit side by side in one cache (one archive), and a scan just picks
+    # the one that matches --yara-rules instead of recompiling.
+    _clam_groups
+    local pack_id pack_dir pack_stamp cached_pack_stamp="" cached_version=""
+    pack_id=$(_yara_pack_id)
+    pack_dir="$cache_dir/packs/$pack_id"
+    pack_stamp="$VERSION|$(_yara_profile_key)|$CLAM_GROUPS"
+    local cache_stamp="$VERSION"
     [ -f "$version_flag" ] && cached_version=$(cat "$version_flag" 2>/dev/null)
+    [ -f "$pack_dir/.stamp" ] && cached_pack_stamp=$(cat "$pack_dir/.stamp" 2>/dev/null)
 
     # FIX (real bug reported): comparing against $sig_input's OWN top-level
     # mtime is fragile — creating ANY new direct child inside it (e.g. an
@@ -2478,28 +2770,38 @@ compile_signatures() {
     # immune to unrelated files appearing alongside it.
     local newest_src=""
     if [ -d "$sig_input" ]; then
-        newest_src=$(bb find "$sig_input" -mindepth 1 -not -path '*/.cache/*' \
+        newest_src=$(bb find "$sig_input" -mindepth 1 -not -path '*/.cache/*' -not -path '*/kernel_refs*' \
             -not -name "ignore_sigs" -not -name ".incremental_cache.tsv" \
             -newer "$compiled_flag" -print -quit 2>/dev/null)
     fi
 
-    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ -z "$newest_src" ] && [ "$cached_version" = "$cache_stamp" ]; then
-        echo -e "[*] Signatures already compiled -> reusing cache ($cache_dir)"
+    # Every pack was compiled from the same sources: when those changed (-u,
+    # newer files, other av.sh version) ALL packs are stale, not only this one.
+    local wipe_packs=false
+    { [ "$DO_UPDATE" = true ] || [ -n "$newest_src" ] || [ "$cached_version" != "$cache_stamp" ]; } && wipe_packs=true
+
+    if [ "$wipe_packs" = false ] && [ -f "$compiled_flag" ] && [ "$cached_pack_stamp" = "$pack_stamp" ]; then
+        echo -e "[*] Signatures already compiled -> reusing cache ($cache_dir, pack '$pack_id')"
         mkdir -p "$out_dir"
         cp -f "$cache_dir"/sha256.tsv "$cache_dir"/sha1.tsv "$cache_dir"/md5.tsv "$cache_dir"/hex_ere.txt \
               "$cache_dir"/strings.txt "$cache_dir"/b64_payloads.tsv "$cache_dir"/mdb.tsv \
               "$cache_dir"/str_sig_map.tsv "$out_dir/" 2>/dev/null || true
-        if [ -s "$cache_dir/yara/rules.yarc" ]; then
-            _yara_prune_sources "$cache_dir/yara"     # caches written by older versions still carry them
-            mkdir -p "$out_dir/yara"
-            cp -f "$cache_dir/yara/rules.yarc" "$out_dir/yara/" 2>/dev/null
-        elif [ -d "$cache_dir/yara" ]; then
-            cp -rf "$cache_dir/yara" "$out_dir/" 2>/dev/null
+        mkdir -p "$out_dir/yara"
+        if [ -s "$pack_dir/rules.yarc" ]; then
+            cp -f "$pack_dir/rules.yarc" "$out_dir/yara/" 2>/dev/null
+        else
+            # no compiled set (no yarac when the pack was built): text fallback
+            cp -f "$pack_dir"/*.yar "$pack_dir"/*.yara "$out_dir/yara/" 2>/dev/null
         fi
         return 0
     fi
-    [ -n "$cached_version" ] && [ "$cached_version" != "$cache_stamp" ] && \
-        echo -e "${Y}[*] av.sh version or YARA profile changed ($cached_version -> $cache_stamp) -> recompiling signatures${Z}"
+    if [ "$wipe_packs" = true ] && [ -n "$cached_version" ] && [ "$cached_version" != "$cache_stamp" ]; then
+        echo -e "${Y}[*] av.sh version changed ($cached_version -> $cache_stamp) -> recompiling signatures${Z}"
+    elif [ -n "$cached_pack_stamp" ] && [ "$cached_pack_stamp" != "$pack_stamp" ]; then
+        echo -e "${Y}[*] YARA pack '$pack_id' changed -> recompiling${Z}"
+    else
+        echo -e "[*] Building YARA pack '$pack_id' (groups: ${CLAM_GROUPS})"
+    fi
 
     echo -e "[*] Compiling signatures into flat artifacts..."
 
@@ -2538,6 +2840,7 @@ EOF
             -not -path '*/yara/*' \
             -not -path '*/custom/*' \
             -not -path '*/.cache/*' \
+            -not -path '*/kernel_refs/*' \
             -not -name "*.pack" -not -name "*.idx" -not -name "*.cvd" \
             -not -name "*.yarc" -not -name "*.compiled" \
             -not -name "*.yar" -not -name "*.yara" \
@@ -2629,6 +2932,14 @@ EOF
     # path, jump distances stay EXACT — YARA is built to handle this at
     # scale, so there is no need to loosen them to "any distance".
     local ndb2yara_fn='
+        function clam_grp(t) {
+            if (t == "" || t == "0") return "any"
+            if (t == "3" || t == "7") return "script"
+            if (t == "6") return "elf"
+            if (t == "1") return "pe"
+            if (t == "2" || t == "4" || t == "10" || t == "11" || t == "12") return "doc"
+            return "other"
+        }
         function ndb2yara(raw,    s, out, i, c, n, buf, j, spec, inner, alts, cnt, k, a, pa, m, alt_out) {
             s = tolower(raw)
             gsub(/[ \t]+/, "", s)
@@ -2748,8 +3059,8 @@ EOF
     local tmp_raw_sigs="$out_dir/raw_compiled.tmp"
     : > "$tmp_raw_sigs"
     mkdir -p "$out_dir/yara"
-    local tmp_yara_rules="$out_dir/yara/generated_ndb_ldb.yar"
-    : > "$tmp_yara_rules"
+    _clam_groups
+    echo "  [*] ClamAV target groups in this pack: ${CLAM_GROUPS}"
 
     # --- HASH category (.hdb/.hdu/.hsb/.hsu): "hash:size:name" ---
     if [ ${#hash_files[@]} -gt 0 ]; then
@@ -2819,7 +3130,7 @@ EOF
                 if (a[2] == "1") cond = "uint16(0) == 0x5A4D and $a"
                 else if (a[2] == "6") cond = "uint32(0) == 0x464c457f and $a"
                 rname = rule_id(a[1], "n")
-                print "YARARULE\trule " rname " { strings: $a = { " yhex " } condition: " cond " }"
+                print "YARARULE_" clam_grp(a[2]) "\trule " rname " { strings: $a = { " yhex " } condition: " cond " }"
             }
         '
         cat "$tmp_ndb_out" >> "$tmp_raw_sigs"
@@ -2895,7 +3206,7 @@ EOF
                 if (tt == "1") cond = "uint16(0) == 0x5A4D and (" cond ")"
                 else if (tt == "6") cond = "uint32(0) == 0x464c457f and (" cond ")"
                 rname = rule_id(a[1], "l")
-                print "YARARULE\trule " rname " { strings: " strs "condition: " cond " }"
+                print "YARARULE_" clam_grp(tt) "\trule " rname " { strings: " strs "condition: " cond " }"
             }
         '
         cat "$tmp_ldb_out" >> "$tmp_raw_sigs"
@@ -2998,15 +3309,22 @@ EOF
 
     if [ -s "$tmp_raw_sigs" ]; then
         # Distribute the merged processed stream into the .tsv/.txt/.yar outputs
-        bb awk -F'\t' -v out="$out_dir" '
+        bb awk -F'\t' -v out="$out_dir" -v groups=" $CLAM_GROUPS " '
             $1 == "SHA256"   { print $2 "\t" $3 >> (out "/sha256.tsv") }
             $1 == "SHA1"     { print $2 "\t" $3 >> (out "/sha1.tsv") }
             $1 == "MD5"      { print $2 "\t" $3 >> (out "/md5.tsv") }
             $1 == "STR"      { print $2 >> (out "/strings.txt") }
             $1 == "B64"      { print $2 "\t" $3 >> (out "/b64_payloads.tsv") }
             $1 == "HEX"      { print $2 >> (out "/hex_ere.txt") }
-            $1 == "YARARULE" { print $2 >> (out "/yara/generated_ndb_ldb.yar") }
+            $1 ~ /^YARARULE_/ {
+                g = substr($1, 10)
+                if (index(groups, " " g " ")) { print $2 >> (out "/yara/generated_ndb_ldb." g ".yar"); gn[g]++ } else gs[g]++
+            }
             $1 == "SECTMD5"  { print $2 "\t" $3 "\t" $4 >> (out "/mdb.tsv") }
+            END {
+                for (g in gn) printf "  [*] ClamAV->YARA group %-6s %8d rule(s) kept\n", g, gn[g]
+                for (g in gs) printf "  [*] ClamAV->YARA group %-6s %8d rule(s) left out of this pack\n", g, gs[g]
+            }
         ' "$tmp_raw_sigs"
     fi
     rm -f "$tmp_raw_sigs"
@@ -3210,15 +3528,15 @@ EOF
         local gen_file=""
         while IFS= read -r yf; do
             [ -z "$yf" ] && continue
-            if [ "${yf##*/}" = "generated_ndb_ldb.yar" ]; then
-                # our own converter's output: not validated separately (see
-                # _yara_compile_ns) — straight into the combined set
+            case "${yf##*/}" in generated_ndb_ldb.*.yar)
+                # our own converter's output (one file per ClamAV target
+                # group): not validated separately (see _yara_compile_ns)
                 gen_file="$yf"
                 echo "include \"$yf\"" >> "$yara_index"
                 yara_ns_args+=("n${included}:$yf")
                 included=$((included + 1))
-                continue
-            fi
+                continue ;;
+            esac
             if "$YARAC_BIN" "${yara_extvars[@]}" "$yf" /dev/null &>/dev/null; then
                 echo "include \"$yf\"" >> "$yara_index"
                 # one NAMESPACE per file: the same rule name legitimately
@@ -3235,9 +3553,9 @@ EOF
 
         local t_c0 ngen=0
         t_c0=$(date +%s)
-        [ -n "$gen_file" ] && ngen=$(grep -c '^rule ' "$gen_file" 2>/dev/null)
+        [ -n "$gen_file" ] && ngen=$(cat "$out_dir"/yara/generated_ndb_ldb.*.yar 2>/dev/null | grep -c '^rule ')
         echo "  [*] Compiling the YARA ruleset: ${included} file(s)$([ -n "$gen_file" ] && echo ", incl. ${ngen} ClamAV-converted rule(s) — the ClamAV part alone can take several minutes (it is not stuck)")..."
-        if [ "${#yara_ns_args[@]}" -gt 0 ] && _yara_compile_ns "$gen_file"; then
+        if [ "${#yara_ns_args[@]}" -gt 0 ] && _yara_compile_ns; then
             echo "  [*] YARA ruleset compiled in $(( $(date +%s) - t_c0 ))s"
         elif [ -s "$yara_index" ] && "$YARAC_BIN" "${yara_extvars[@]}" "$yara_index" "$out_dir/yara/rules.yarc" 2>/dev/null; then
             :
@@ -3287,12 +3605,16 @@ EOF
     # that no longer generates one at all). rm -rf the cache's yara/ dir
     # first so a recompile can't leave stale artifacts behind.
     mkdir -p "$cache_dir"
-    rm -rf "$cache_dir/yara" 2>/dev/null
+    rm -rf "$cache_dir/yara" 2>/dev/null                       # layout of versions before packs
+    [ "$wipe_packs" = true ] && rm -rf "$cache_dir/packs" 2>/dev/null
+    rm -rf "$pack_dir" 2>/dev/null
+    mkdir -p "$pack_dir"
     _yara_prune_sources "$out_dir/yara"
     cp -f "$out_dir"/sha256.tsv "$out_dir"/sha1.tsv "$out_dir"/md5.tsv "$out_dir"/hex_ere.txt \
           "$out_dir"/strings.txt "$out_dir"/b64_payloads.tsv "$out_dir"/mdb.tsv \
           "$out_dir"/str_sig_map.tsv "$cache_dir/" 2>/dev/null || true
-    [ -d "$out_dir/yara" ] && cp -rf "$out_dir/yara" "$cache_dir/" 2>/dev/null
+    [ -d "$out_dir/yara" ] && cp -rf "$out_dir/yara/." "$pack_dir/" 2>/dev/null
+    printf '%s' "$pack_stamp" > "$pack_dir/.stamp" 2>/dev/null || true
     touch "$compiled_flag" 2>/dev/null || true
     printf '%s' "$cache_stamp" > "$version_flag" 2>/dev/null || true
 
@@ -3586,6 +3908,56 @@ scan_processes() {
 CHECK_KERNEL=false     # -K/--check-kernel
 OFFLINE_ROOT=""         # --offline-root PATH — see module comment above
 
+# Compares every boot/vmlinuz-* with a list of KNOWN kernel builds shipped in
+# signatures/kernel_refs/*.tsv (made by tools/gen_kernel_refs.sh from the
+# distribution's own packages: hash<TAB>file<TAB>package<TAB>version<TAB>suite,
+# hash = md5 (deb) or sha256 (rpm), told apart by length).
+# Unlike the dpkg-based check below this needs no package manager and no
+# trust in the checksums stored on the inspected disk — a rescue system such as
+# SystemRescue (no dpkg) can run it, and a rootkit that also rewrote the
+# disk's own dpkg md5sums cannot hide a modified kernel from it.
+# Verdicts: match = OK; file name is a known kernel but the md5 matches none
+# of its known builds = MISMATCH (strong); md5 known under another name =
+# RENAMED; name not in the list = UNKNOWN (custom/other distro — look, not proof).
+KREF_FINDINGS=0
+scan_kernel_refs() {
+    local root="${OFFLINE_ROOT:-}" refdir="${SIGNATURES}/kernel_refs" f name md5 sha res verdict a b
+    KREF_FINDINGS=0
+    if ! ls "$refdir"/*.tsv >/dev/null 2>&1; then
+        echo -e "${Y}[INFO] No kernel reference list (${refdir}/*.tsv) -> skipping the known-kernel comparison${Z}"
+        return
+    fi
+    local nref; nref=$(cat "$refdir"/*.tsv 2>/dev/null | grep -vc '^#')
+    echo -e "${B}[*] Comparing boot kernels with ${nref} known kernel builds...${Z}"
+    local seen=0
+    for f in "${root}/boot"/vmlinuz-*; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        seen=$((seen + 1))
+        name="${f##*/}"
+        md5=$(md5sum "$f" 2>/dev/null | cut -d' ' -f1)
+        sha=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+        [ -n "$md5" ] || continue
+        # the first column is an md5 (32 hex, deb packages) or a sha256 (64 hex,
+        # rpm packages) — a file matches when either of its hashes is listed
+        res=$(cat "$refdir"/*.tsv 2>/dev/null | awk -F'\t' -v h="$md5" -v h2="$sha" -v n="$name" '
+            /^#/ { next }
+            ($1 == h || $1 == h2) && $2 == n { ok = $3 " " $4 }
+            ($1 == h || $1 == h2) && $2 != n { other = $2 " (" $3 " " $4 ")" }
+            $2 == n { known = 1 }
+            END { if (ok != "") print "OK\t" ok; else if (other != "") print "RENAMED\t" other; else if (known) print "MISMATCH"; else print "UNKNOWN" }')
+        verdict="${res%%$'\t'*}"; a="${res#*$'\t'}"
+        case "$verdict" in
+            OK)       echo -e "${G}[OK] ${f} = ${a} (matches the distribution's package)${Z}" ;;
+            MISMATCH) echo -e "${R}[!] [KERNEL_REF_MISMATCH] ${f} — '${name}' is a known kernel, but this file's md5 (${md5}) matches NONE of its known builds${Z}"
+                      KREF_FINDINGS=$((KREF_FINDINGS + 1)) ;;
+            RENAMED)  echo -e "${Y}[!] [KERNEL_REF_RENAMED] ${f} — content equals ${a}, but the file has a different name${Z}"
+                      KREF_FINDINGS=$((KREF_FINDINGS + 1)) ;;
+            *)        echo -e "${Y}[?] [KERNEL_REF_UNKNOWN] ${f} (md5 ${md5}) — not in the list: custom kernel, another distribution, or newer/older than the list${Z}" ;;
+        esac
+    done
+    [ "$seen" -eq 0 ] && echo -e "${Y}[INFO] No boot/vmlinuz-* regular files found under ${root:-/}boot${Z}"
+}
+
 scan_kernel_integrity() {
     local root="${OFFLINE_ROOT:-}"
     echo -e "${B}[*] Checking kernel/boot file integrity...${Z}"
@@ -3597,15 +3969,17 @@ scan_kernel_integrity() {
         echo -e "       disk read-only, and re-run with --offline-root.${Z}"
     fi
 
+    scan_kernel_refs
+
     if ! command -v dpkg &>/dev/null; then
-        echo -e "${Y}[WARN] dpkg not found -> can't cross-check against package records, skipping${Z}"
+        echo -e "${Y}[WARN] dpkg not found -> can't cross-check against the disk's package records (the known-kernel comparison above does not need it)${Z}"
         return
     fi
 
     local dpkg_root_arg=()
     [ -n "$root" ] && dpkg_root_arg=(--root="$root")
 
-    local found=0 pkg md5file relpath expected actual f
+    local found=$KREF_FINDINGS pkg md5file relpath expected actual f
     # Every /boot and /lib/modules file that dpkg -S can attribute to a
     # package gets its checksum cross-checked against that package's own
     # record. Files it can't attribute at all (not owned by any package —
@@ -3643,6 +4017,414 @@ scan_kernel_integrity() {
         echo -e "    rebuild — do not attempt to patch a compromised kernel/module in place."
     fi
 }
+
+#__AUDIT_MODULE_START__
+# ============================================================================
+# MODULE: compromise audit (--audit, --audit-since DATE)
+#
+# Everything the file scanner CANNOT see: a clean disk full of clean files can
+# still belong to an attacker who simply logged in with a guessed root password
+# (no malware needed). This module is self-contained and read-only: it does not
+# touch signatures, workers or the scan pipeline, so it runs in seconds.
+#   ./av.sh --offline-root /mnt/suspect-root --audit
+#   ./av.sh --offline-root /mnt/suspect-root --audit-since 2026-09-29 -o audit.txt
+# (live, without --offline-root, it works too, but see the -K comment about
+# trusting the running kernel.)
+#
+# Checks: effective sshd settings (first value wins across Include files),
+# UID-0 / empty-password / service accounts with a shell, authorized_keys,
+# /etc/ld.so.preload, cron / systemd / rc.local / shell-startup persistence,
+# executables and ELF files in tmp dirs, known miner / brute-force tool names,
+# shell history (wiped or suspicious), docker API on TCP, and sshd auth logs:
+# successful login after many failures (password guessed), failed logins from
+# 127.0.0.1 (brute force launched FROM this host or tunnelled through it),
+# logins from different IPs seconds apart (credential hand-over), root
+# password logins, and logins missing from wtmp (no tty = command / tunnel).
+# Findings are indicators, not proof: HIGH = act on it, MED = look at it.
+# Exit code: 0 nothing, 1 only MED, 2 at least one HIGH.
+# ============================================================================
+AUDIT_MODE=false          # --audit
+AUDIT_SINCE=""            # --audit-since YYYY-MM-DD: also list recently changed system files
+AUD_HIGH=0; AUD_MED=0; AUD_INFO=0
+AUD_CNT=""                # counters live in a file: findings are printed from pipeline subshells too
+AUD_ROOT=""
+AUD_SSHD=""
+AUD_PAT_STRONG='(curl|wget|fetch)[^|;&]*[|;&] *(ba|z|da|k)?sh([^a-z]|$)|(nc|ncat|netcat) +([^;|&]* )?-[a-zA-Z]*e( |$)|/dev/tcp/|base64 +(-d|--decode)|python[0-9.]* +-c|perl +-e|bash +-i|chmod +(\+?x|[0-7]{3,4}) +/(tmp|var/tmp|dev/shm)|xmrig|minerd|cpuminer|kinsing|kdevtmpfsi|stratum\+tcp|(^|[ /])(hydra|medusa|ncrack|masscan)( |$)|unset +HISTFILE|history +-c'
+AUD_PAT_WEAK="${AUD_PAT_STRONG}|/(tmp|var/tmp|dev/shm)/[^ ]+"
+
+_aud() {   # severity tag text...
+    local sev="$1" tag="$2"; shift 2
+    case "$sev" in
+        HIGH) echo -e "${R}[!] [AUDIT_${tag}] $*${Z}"; echo H >> "$AUD_CNT" ;;
+        MED)  echo -e "${Y}[?] [AUDIT_${tag}] $*${Z}"; echo M >> "$AUD_CNT" ;;
+        *)    echo -e "    [AUDIT_${tag}] $*";          echo I >> "$AUD_CNT" ;;
+    esac
+}
+
+_aud_mtime() { date -r "$1" '+%F %T' 2>/dev/null || echo "?"; }
+
+# sshd_config parsed the way sshd does it: top to bottom, Include expanded in
+# place, FIRST value of a keyword wins, Match blocks ignored.
+# emits: key<TAB>value<TAB>file:line
+_aud_sshd_collect() {
+    local f="$1" depth="${2:-0}" n=0 line key g gg inmatch=0
+    [ "$depth" -gt 5 ] && return 0
+    [ -f "$f" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$(( n + 1 ))
+        line="${line%%#*}"
+        set -f; set -- $line; set +f      # no globbing of Include patterns here
+        [ $# -ge 1 ] || continue
+        key=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+        case "$key" in
+            match) inmatch=1; continue ;;
+            include)
+                shift
+                for g in "$@"; do
+                    case "$g" in /*) g="${AUD_ROOT}${g}" ;; *) g="${AUD_ROOT}/etc/ssh/${g}" ;; esac
+                    for gg in $g; do [ -f "$gg" ] && _aud_sshd_collect "$gg" $(( depth + 1 )); done
+                done
+                continue ;;
+        esac
+        [ "$inmatch" = 1 ] && continue
+        shift
+        printf '%s\t%s\t%s\n' "$key" "$*" "${f#"$AUD_ROOT"}:$n"
+    done < "$f"
+}
+_aud_sshd_val() {   # keyword default -> "value<TAB>where"
+    local r
+    r=$(printf '%s\n' "$AUD_SSHD" | awk -F'\t' -v k="$1" '$1==k{print $2"\t"$3; exit}')
+    [ -n "$r" ] && printf '%s\n' "$r" || printf '%s\t(default)\n' "$2"
+}
+
+_aud_check_sshd() {
+    echo -e "${B}[*] sshd configuration${Z}"
+    if [ ! -f "$AUD_ROOT/etc/ssh/sshd_config" ]; then
+        _aud INFO SSHD "no /etc/ssh/sshd_config (sshd not installed?)"; return 0
+    fi
+    AUD_SSHD=$(_aud_sshd_collect "$AUD_ROOT/etc/ssh/sshd_config" 0)
+    local prl pa pe prl_v prl_w pa_v pa_w dup
+    prl=$(_aud_sshd_val permitrootlogin prohibit-password); prl_v="${prl%%$'\t'*}"; prl_w="${prl#*$'\t'}"
+    pa=$(_aud_sshd_val passwordauthentication yes);          pa_v="${pa%%$'\t'*}";   pa_w="${pa#*$'\t'}"
+    pe=$(_aud_sshd_val permitemptypasswords no)
+    prl_v=$(printf '%s' "$prl_v" | tr 'A-Z' 'a-z'); pa_v=$(printf '%s' "$pa_v" | tr 'A-Z' 'a-z')
+    if [ "$prl_v" = "yes" ] && [ "$pa_v" != "no" ]; then
+        _aud HIGH SSH_ROOT_PASSWORD "root can log in with a PASSWORD over SSH (PermitRootLogin ${prl_v} @ ${prl_w}; PasswordAuthentication ${pa_v} @ ${pa_w}) — brute-forceable from the internet"
+    elif [ "$prl_v" = "yes" ]; then
+        _aud MED SSH_ROOT_LOGIN "PermitRootLogin yes @ ${prl_w} (password auth is off, keys only)"
+    elif [ "$pa_v" != "no" ]; then
+        _aud INFO SSH_PASSWORD "PasswordAuthentication ${pa_v} @ ${pa_w} (root: ${prl_v})"
+    else
+        _aud INFO SSH_OK "root: ${prl_v}, password auth: ${pa_v}"
+    fi
+    [ "$(printf '%s' "${pe%%$'\t'*}" | tr 'A-Z' 'a-z')" = "yes" ] && _aud HIGH SSH_EMPTY_PW "PermitEmptyPasswords yes @ ${pe#*$'\t'}"
+    # a later, ignored, contradicting value is the classic "I disabled it but it still works"
+    for k in permitrootlogin passwordauthentication; do
+        dup=$(printf '%s\n' "$AUD_SSHD" | awk -F'\t' -v k="$k" '$1==k{n++; if(n==1){v=$2} else if($2!=v){print k" "$2" @ "$3" (IGNORED, first value wins: "v")"}}')
+        [ -n "$dup" ] && printf '%s\n' "$dup" | while IFS= read -r l; do _aud INFO SSH_OVERRIDDEN "$l"; done
+    done
+    printf '%s\n' "$AUD_SSHD" | awk -F'\t' '$1=="authorizedkeyscommand" || ($1=="authorizedkeysfile" && $2 !~ /\.ssh\/authorized_keys/) {print $1" "$2" @ "$3}' |
+        while IFS= read -r l; do _aud MED SSH_KEYS_CFG "non-default key lookup: $l"; done
+    _aud INFO SSH_PORT "Port $(_aud_sshd_val port 22 | cut -f1)"
+}
+
+_aud_homes() {
+    { awk -F: '$6!="" && $6!="/" && $7!~/(nologin|false)$/ {print $6}' "$AUD_ROOT/etc/passwd" 2>/dev/null; echo /root; } | sort -u
+}
+
+_aud_check_accounts() {
+    echo -e "${B}[*] accounts and keys${Z}"
+    local pw="$AUD_ROOT/etc/passwd" sh="$AUD_ROOT/etc/shadow" l h f n cm
+    if [ -f "$pw" ]; then
+        awk -F: '$3==0 && $1!="root"{print $1}' "$pw" | while IFS= read -r l; do
+            _aud HIGH UID0 "extra account with UID 0: $l"; done
+        awk -F: '$3>0 && $3<1000 && $7!~/(nologin|false|sync|halt|shutdown)$/ && $7!=""{print $1" ("$7")"}' "$pw" | while IFS= read -r l; do
+            _aud MED SYSTEM_SHELL "system account with a login shell: $l"; done
+        l=$(awk -F: '$3>=1000 && $1!="nobody" && $7!~/(nologin|false)$/{printf "%s ", $1}' "$pw")
+        [ -n "$l" ] && _aud INFO USERS "login-capable users: $l"
+    fi
+    if [ -r "$sh" ]; then
+        awk -F: '$2==""{print $1}' "$sh" | while IFS= read -r l; do _aud HIGH EMPTY_PASSWORD "account with EMPTY password: $l"; done
+    fi
+    for f in "$AUD_ROOT"/etc/sudoers "$AUD_ROOT"/etc/sudoers.d/*; do
+        [ -f "$f" ] || continue
+        grep -nE '^[^#]*NOPASSWD' "$f" 2>/dev/null | head -5 | while IFS= read -r l; do
+            _aud INFO SUDO_NOPASSWD "${f#"$AUD_ROOT"}:$l"; done
+    done
+    for h in $(_aud_homes); do
+        for f in "$AUD_ROOT$h/.ssh/authorized_keys" "$AUD_ROOT$h/.ssh/authorized_keys2"; do
+            [ -f "$f" ] || continue
+            n=$(grep -cvE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)
+            [ "${n:-0}" -eq 0 ] && continue
+            cm=$(grep -vE '^[[:space:]]*(#|$)' "$f" | awk '{printf "%s ", $NF}' | cut -c1-150)
+            if [ "$h" = "/root" ]; then
+                _aud MED AUTHORIZED_KEYS "${f#"$AUD_ROOT"}: ${n} key(s), modified $(_aud_mtime "$f") — comments: ${cm}"
+            else
+                _aud INFO AUTHORIZED_KEYS "${f#"$AUD_ROOT"}: ${n} key(s), modified $(_aud_mtime "$f") — comments: ${cm}"
+            fi
+            grep -vE '^[[:space:]]*(#|$)' "$f" | grep -vE '^(ssh-|ecdsa-|sk-)' | cut -c1-120 | head -3 | while IFS= read -r l; do
+                _aud MED KEY_OPTIONS "${f#"$AUD_ROOT"}: key with options (forced command / restrictions): $l"; done
+        done
+    done
+    if [ -s "$AUD_ROOT/etc/ld.so.preload" ]; then
+        _aud HIGH LD_PRELOAD "/etc/ld.so.preload is not empty (userland rootkit vector): $(tr '\n' ' ' < "$AUD_ROOT/etc/ld.so.preload" | cut -c1-200)"
+    fi
+}
+
+# lines of file(s) matching a pattern -> findings (comments skipped, max 8 per file)
+_aud_pat_scan() {   # severity tag pattern file...
+    local sev="$1" tag="$2" pat="$3" f ln shown; shift 3
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        shown=0
+        while IFS= read -r ln; do
+            _aud "$sev" "$tag" "${f#"$AUD_ROOT"}:$(printf '%s' "$ln" | cut -c1-200)"
+            shown=$(( shown + 1 )); [ "$shown" -ge 8 ] && break
+        done < <(grep -nE -- "$pat" "$f" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#')
+    done
+}
+
+_aud_check_persistence() {
+    echo -e "${B}[*] persistence: cron, systemd, rc.local, shell startup${Z}"
+    local d f h
+    # per-user crontabs: any content is worth a glance on a hosting box
+    for f in "$AUD_ROOT"/var/spool/cron/crontabs/* "$AUD_ROOT"/var/spool/cron/*; do
+        [ -f "$f" ] || continue
+        grep -vE '^[[:space:]]*(#|$)' "$f" 2>/dev/null | cut -c1-160 | head -10 | while IFS= read -r l; do
+            _aud INFO CRONTAB "${f#"$AUD_ROOT"}: $l"; done
+    done
+    _aud_pat_scan MED CRON_SUSPICIOUS "$AUD_PAT_WEAK" \
+        "$AUD_ROOT"/etc/crontab "$AUD_ROOT"/etc/cron.d/* "$AUD_ROOT"/var/spool/cron/crontabs/* "$AUD_ROOT"/var/spool/cron/*
+    for d in hourly daily weekly monthly; do
+        _aud_pat_scan MED CRON_SUSPICIOUS "$AUD_PAT_STRONG" "$AUD_ROOT"/etc/cron.$d/*
+    done
+    # systemd: only ExecStart-like lines; admin-made units in /etc get the weak pattern
+    for f in "$AUD_ROOT"/etc/systemd/system/*.service "$AUD_ROOT"/etc/systemd/system/*/*.service; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        _aud_pat_scan MED SYSTEMD_SUSPICIOUS "^[[:space:]]*Exec[A-Za-z]*=.*(${AUD_PAT_WEAK})" "$f"
+    done
+    for f in "$AUD_ROOT"/usr/lib/systemd/system/*.service "$AUD_ROOT"/lib/systemd/system/*.service; do
+        [ -f "$f" ] || continue
+        _aud_pat_scan MED SYSTEMD_SUSPICIOUS "^[[:space:]]*Exec[A-Za-z]*=.*(${AUD_PAT_STRONG})" "$f"
+    done
+    _aud_pat_scan MED STARTUP_SUSPICIOUS "$AUD_PAT_STRONG" "$AUD_ROOT"/etc/rc.local "$AUD_ROOT"/etc/profile \
+        "$AUD_ROOT"/etc/bash.bashrc "$AUD_ROOT"/etc/profile.d/*
+    for h in $(_aud_homes); do
+        for f in .bashrc .profile .bash_profile .bash_login .bash_logout .zshrc; do
+            _aud_pat_scan MED STARTUP_SUSPICIOUS "$AUD_PAT_WEAK" "$AUD_ROOT$h/$f"
+        done
+    done
+    # docker API exposed on TCP = remote root for anyone
+    for f in "$AUD_ROOT"/etc/docker/daemon.json "$AUD_ROOT"/etc/systemd/system/docker.service.d/* \
+             "$AUD_ROOT"/lib/systemd/system/docker.service "$AUD_ROOT"/usr/lib/systemd/system/docker.service; do
+        [ -f "$f" ] || continue
+        grep -nE 'tcp://(0\.0\.0\.0|\[::\]|:)' "$f" 2>/dev/null | head -3 | while IFS= read -r l; do
+            _aud HIGH DOCKER_TCP "${f#"$AUD_ROOT"}: docker API on TCP: $l"; done
+    done
+}
+
+_aud_check_files() {
+    echo -e "${B}[*] tmp directories, tools, shell history${Z}"
+    local d f n=0 magic h hs pat
+    for d in tmp var/tmp dev/shm run/shm; do
+        [ -d "$AUD_ROOT/$d" ] || continue
+        n=0
+        while IFS= read -r f; do
+            n=$(( n + 1 )); [ "$n" -gt 400 ] && break
+            magic=$(head -c4 "$f" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+            # /dev/shm and hidden names are where attack tools live; an ELF in plain
+            # /tmp is often just an installer or driver, so that is only worth a look
+            if [ "$magic" = "7f454c46" ]; then
+                case "$d:${f##*/}" in
+                    dev/shm:*|run/shm:*|*:.*) _aud HIGH TMP_ELF "ELF binary in /$d (shm / hidden name): ${f#"$AUD_ROOT"} ($(_aud_mtime "$f"))" ;;
+                    *) _aud MED TMP_ELF "ELF binary in /$d: ${f#"$AUD_ROOT"} ($(_aud_mtime "$f"))" ;;
+                esac
+            elif [ -x "$f" ]; then
+                case "$d" in
+                    dev/shm|run/shm) _aud MED TMP_EXEC "executable file in /$d: ${f#"$AUD_ROOT"} ($(_aud_mtime "$f"))" ;;
+                    *) _aud INFO TMP_EXEC "executable file in /$d: ${f#"$AUD_ROOT"} ($(_aud_mtime "$f"))" ;;
+                esac
+            fi
+        done < <(find "$AUD_ROOT/$d" -xdev -maxdepth 4 -type f 2>/dev/null)
+    done
+    for d in tmp var/tmp dev/shm root home opt usr/local/bin usr/local/sbin; do
+        [ -d "$AUD_ROOT/$d" ] || continue
+        find "$AUD_ROOT/$d" -xdev -maxdepth 4 -type f \( -iname 'xmrig*' -o -iname 'minerd*' -o -iname 'cpuminer*' \
+            -o -iname 'kinsing*' -o -iname 'kdevtmpfsi*' -o -iname 'hydra' -o -iname 'medusa' -o -iname 'ncrack' \
+            -o -iname 'masscan' -o -iname 'zmap' -o -iname 'pnscan' -o -iname 'libprocesshider*' \
+            -o -iname 'diamorphine*' -o -iname 'sshbrute*' \) 2>/dev/null | head -20 |
+            while IFS= read -r f; do _aud MED TOOL_NAME "miner / brute-force / rootkit tool by file name: ${f#"$AUD_ROOT"}"; done
+    done
+    for h in $(_aud_homes); do
+        for hs in .bash_history .zsh_history; do
+            f="$AUD_ROOT$h/$hs"
+            if [ -L "$f" ] && [ "$(readlink "$f")" = "/dev/null" ]; then
+                _aud MED HISTORY_WIPED "${f#"$AUD_ROOT"} -> /dev/null (history disabled)"; continue
+            fi
+            [ -e "$f" ] || continue
+            if [ ! -s "$f" ]; then
+                _aud MED HISTORY_EMPTY "${f#"$AUD_ROOT"} exists but is EMPTY (modified $(_aud_mtime "$f")) — history cleared?"; continue
+            fi
+            _aud_pat_scan MED HISTORY_SUSPICIOUS "$AUD_PAT_STRONG" "$f"
+        done
+    done
+}
+
+_aud_check_authlog() {
+    echo -e "${B}[*] sshd authentication logs${Z}"
+    local logs=() f out acc loc hop nacc nfail tot
+    while IFS= read -r f; do [ -n "$f" ] && logs+=("$f"); done < <(lst=$(ls -1 "$AUD_ROOT"/var/log/auth.log* "$AUD_ROOT"/var/log/secure* 2>/dev/null | sort -u)
+                  printf '%s\n' "$lst" | sort -rV 2>/dev/null || printf '%s\n' "$lst" | sort -r)
+    if [ "${#logs[@]}" -eq 0 ]; then
+        _aud INFO AUTHLOG "no /var/log/auth.log* or /var/log/secure* found (journald only? try: journalctl -D <root>/var/log/journal -u ssh)"
+        return 0
+    fi
+    out=$(for f in "${logs[@]}"; do
+            case "$f" in
+                *.gz) gzip -dc "$f" 2>/dev/null ;;
+                *.bz2) bzip2 -dc "$f" 2>/dev/null ;;
+                *.xz) xz -dc "$f" 2>/dev/null ;;
+                *) cat "$f" 2>/dev/null ;;
+            esac
+          done | awk '
+        function ts_of(   mo, day, t, h) {
+            if ($1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) {
+                mo = substr($1,6,2)+0; day = substr($1,9,2)+0; t = substr($1,12,8); LABEL = substr($1,1,10) " " t
+            } else {
+                mo = (index("JanFebMarAprMayJunJulAugSepOctNovDec", $1)+2)/3; day = $2+0; t = $3; LABEL = $1 " " $2 " " $3
+            }
+            split(t, h, ":")
+            return (CUM[mo]+day)*86400 + h[1]*3600 + h[2]*60 + h[3]
+        }
+        BEGIN { split("0 31 59 90 120 151 181 212 243 273 304 334", CUM, " ") }
+        /sshd(\[[0-9]+\])?: Failed [a-z-]+ for / {
+            ip=""; u=""
+            for (i=1;i<=NF;i++) { if ($i=="for" && u=="") { u=$(i+1); if (u=="invalid") u=$(i+3) } if ($i=="from") { ip=$(i+1); break } }
+            ts_of(); fail[ip]++; nfail++
+            if (ip=="127.0.0.1" || ip=="::1" || ip=="::ffff:127.0.0.1") {
+                lf++; if (lf==1) lfirst=LABEL; llast=LABEL
+                if (!(u in lu) && nlu<8) { lu[u]=1; nlu++; lulist=lulist u " " }
+            }
+            next
+        }
+        /sshd(\[[0-9]+\])?: Accepted / {
+            for (i=1;i<=NF;i++) if ($i=="Accepted") { a=i; break }
+            meth=$(a+1); user=$(a+3); ip=$(a+5)
+            ts=ts_of(); k=ip SUBSEP user SUBSEP meth
+            if (!(k in cnt)) { first[k]=LABEL; pf[k]=fail[ip]+0 }
+            cnt[k]++; last[k]=LABEL
+            if (lastip!="" && ip!=lastip && ts>=lastts && ts-lastts<=60) hop[++nh]=lastlabel "\t" lastip "\t" LABEL "\t" ip "\t" user
+            lastip=ip; lastts=ts; lastlabel=LABEL
+        }
+        END {
+            for (k in cnt) { split(k, p, SUBSEP); printf "ACC\t%s\t%s\t%s\t%d\t%s\t%s\t%d\n", p[1], p[2], p[3], cnt[k], first[k], last[k], pf[k] }
+            for (i=1;i<=nh;i++) print "HOP\t" hop[i]
+            print "LOCAL\t" lf+0 "\t" lfirst "\t" llast "\t" lulist
+            print "TOTAL\t" nfail+0
+        }')
+    _aud INFO AUTHLOG "parsed ${#logs[@]} log file(s): $(printf '%s ' "${logs[@]##*/}")"
+    nfail=$(printf '%s\n' "$out" | awk -F'\t' '$1=="TOTAL"{print $2}')
+    _aud INFO AUTHLOG "failed password attempts in these logs: ${nfail:-0}"
+    # 1. success after many failures from the same IP = password guessed
+    printf '%s\n' "$out" | awk -F'\t' '$1=="ACC" && $8>=3' | sort | while IFS=$'\t' read -r _ ip user meth cnt first lastl pf; do
+        _aud HIGH LOGIN_AFTER_BRUTEFORCE "'${user}' logged in by ${meth} from ${ip} at ${first} (x${cnt}, last ${lastl}) AFTER ${pf} failed attempts from that IP — password was probably guessed"
+    done
+    # 2. brute force from the host itself
+    loc=$(printf '%s\n' "$out" | awk -F'\t' '$1=="LOCAL"')
+    if [ -n "$loc" ]; then
+        IFS=$'\t' read -r _ n first lastl ulist <<< "$loc"
+        [ "${n:-0}" -ge 5 ] && _aud HIGH LOCAL_BRUTEFORCE "${n} failed SSH logins FROM 127.0.0.1 between ${first} and ${lastl} (users tried: ${ulist}) — a brute-force tool ran on this host, or an SSH tunnel through it"
+    fi
+    # 3. several IPs within a minute
+    printf '%s\n' "$out" | awk -F'\t' '$1=="HOP"' | head -10 | while IFS=$'\t' read -r _ t1 ip1 t2 ip2 user; do
+        _aud MED LOGIN_HANDOVER "logins as '${user}' from different IPs within 60s: ${ip1} (${t1}) then ${ip2} (${t2}) — typical of one actor / credential hand-over"
+    done
+    # 4. root by password
+    nacc=$(printf '%s\n' "$out" | awk -F'\t' '$1=="ACC" && $3=="root" && $4=="password"{n++} END{print n+0}')
+    [ "$nacc" -gt 0 ] && _aud MED ROOT_PASSWORD_LOGINS "root logged in BY PASSWORD from ${nacc} distinct IP(s) in these logs — make sure every one of them is yours"
+    # 5. every successful login (info) — the list the customer has to recognise
+    printf '%s\n' "$out" | awk -F'\t' '$1=="ACC"' | sort | head -60 | while IFS=$'\t' read -r _ ip user meth cnt first lastl pf; do
+        _aud INFO ACCEPTED "${user} ${meth} from ${ip}  x${cnt}  first ${first}  last ${lastl}  (failed before: ${pf})"
+    done
+    # 6. accepted logins that wtmp never saw = no tty (command / tunnel / script) or wtmp cleaned
+    if command -v last >/dev/null 2>&1 && [ -f "$AUD_ROOT/var/log/wtmp" ]; then
+        local seen
+        seen=$(for f in "$AUD_ROOT"/var/log/wtmp "$AUD_ROOT"/var/log/wtmp.1; do [ -f "$f" ] && last -f "$f" -i -w 2>/dev/null; done |
+               grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u)
+        if [ -n "$seen" ]; then
+            printf '%s\n' "$out" | awk -F'\t' '$1=="ACC" && $2 ~ /^([0-9]+\.){3}[0-9]+$/ {print $2"\t"$3"\t"$6}' | sort -u |
+            while IFS=$'\t' read -r ip user first; do
+                printf '%s\n' "$seen" | grep -qxF "$ip" || \
+                    _aud MED LOGIN_NOT_IN_WTMP "${user} from ${ip} (${first}) is in the auth log but NOT in wtmp — no terminal (remote command, tunnel, script) or wtmp was edited"
+            done
+        fi
+    fi
+}
+
+_aud_check_since() {
+    [ -n "$AUDIT_SINCE" ] || return 0
+    echo -e "${B}[*] system files changed since ${AUDIT_SINCE}${Z}"
+    local d list=()
+    for d in etc root usr/local opt var/spool/cron lib/systemd usr/lib/systemd tmp var/tmp dev/shm usr/bin usr/sbin bin sbin; do
+        [ -d "$AUD_ROOT/$d" ] && list+=("$AUD_ROOT/$d")
+    done
+    find "${list[@]}" -xdev -type f -newermt "$AUDIT_SINCE" -printf '%TY-%Tm-%Td %TH:%TM  %u  %p\n' 2>/dev/null |
+        grep -vE '/etc/(ld\.so\.cache|mtab|resolv\.conf|machine-id|hostname|hosts|adjtime)$|\.pm2/(logs|pids)|/\.npm/|/\.cache/|\.viminfo|\.lesshst|_history$' |
+        sort | head -150 | while IFS= read -r l; do _aud INFO CHANGED "${l/"$AUD_ROOT"/}"; done
+    # home dirs: only hidden files near the top (the rest is customer data — that is the file scanner's job)
+    find "$AUD_ROOT/home" -xdev -maxdepth 3 -type f -name '.*' -newermt "$AUDIT_SINCE" -printf '%TY-%Tm-%Td %TH:%TM  %u  %p\n' 2>/dev/null |
+        grep -vE '_history$|\.viminfo|\.lesshst|/\.cache/' | sort | head -40 | while IFS= read -r l; do _aud INFO CHANGED "${l/"$AUD_ROOT"/}"; done
+}
+
+run_audit() {
+    AUD_ROOT="${OFFLINE_ROOT%/}"
+    AUD_CNT=$(mktemp 2>/dev/null || echo "/tmp/.av_audit_cnt.$$"); : > "$AUD_CNT"
+    if [ -n "$AUDIT_SINCE" ] && ! date -d "$AUDIT_SINCE" >/dev/null 2>&1; then
+        echo "[FAIL] --audit-since needs a date like 2026-09-29 (got: '${AUDIT_SINCE}')" >&2; return 1
+    fi
+    echo -e "${B}[*] Compromise audit of: ${AUD_ROOT:-/ (live system)}${Z}"
+    if [ -z "$AUD_ROOT" ]; then
+        echo -e "${Y}[WARN] Live system: a rootkit can hide from this audit. For a result worth"
+        echo -e "       trusting, boot a rescue system, mount the disk and use --offline-root.${Z}"
+    elif [ ! -d "$AUD_ROOT/etc" ]; then
+        echo -e "${R}[FAIL] ${AUD_ROOT} does not look like a root filesystem (no etc/)${Z}"; return 1
+    fi
+    _aud_check_sshd
+    _aud_check_accounts
+    _aud_check_persistence
+    _aud_check_files
+    _aud_check_authlog
+    _aud_check_since
+    echo ""
+    AUD_HIGH=$(grep -c '^H' "$AUD_CNT" 2>/dev/null); AUD_MED=$(grep -c '^M' "$AUD_CNT" 2>/dev/null); AUD_INFO=$(grep -c '^I' "$AUD_CNT" 2>/dev/null)
+    rm -f "$AUD_CNT"
+    echo -e "${B}[*] Audit summary: ${AUD_HIGH} HIGH, ${AUD_MED} MEDIUM, ${AUD_INFO} info${Z}"
+    if [ "$AUD_HIGH" -gt 0 ]; then
+        echo -e "${R}    HIGH items are strong indicators (guessed password, tooling, rootkit vectors)."
+        echo -e "    Treat the host as compromised: rotate every secret, close password SSH, rebuild if in doubt.${Z}"
+        return 2
+    fi
+    [ "$AUD_MED" -gt 0 ] && { echo -e "${Y}    MEDIUM items need a human look (are these logins / keys / jobs yours?).${Z}"; return 1; }
+    echo -e "${G}    Nothing found by these checks. That is not proof of a clean host.${Z}"
+    return 0
+}
+
+# Wrapper: with -o FILE the report is also saved (without colour codes).
+run_audit_main() {
+    local rc tmp
+    if [ -n "$OUTPUT_FILE" ]; then
+        tmp=$(mktemp 2>/dev/null || echo "/tmp/.av_audit.$$")
+        run_audit > "$tmp" 2>&1; rc=$?
+        cat "$tmp"
+        sed 's/\x1b\[[0-9;]*m//g' "$tmp" >> "$OUTPUT_FILE"
+        rm -f "$tmp"
+        echo "[*] audit report appended to $OUTPUT_FILE"
+    else
+        run_audit; rc=$?
+    fi
+    return "$rc"
+}
+#__AUDIT_MODULE_END__
 
 # ============================================================================
 # 11. MODULE: dependency check
@@ -4524,6 +5306,12 @@ main() {
     detect_platform
     parse_args "$@"
     setup_colors
+    # --audit is a self-contained read-only module (no signatures, no workers):
+    # run it and leave before any of the scan machinery is initialised.
+    if [ "$AUDIT_MODE" = true ]; then
+        run_audit_main
+        exit $?
+    fi
     apply_low_priority
 
     # -I is implied by -w unless the person explicitly said --no-incremental
@@ -4578,6 +5366,11 @@ main() {
     detect_yarac
     [ -x "$SCRIPT_DIR/bin/grep" ] && GREP_BIN="$SCRIPT_DIR/bin/grep"
 
+    # --packs without -u selects the pack to scan with (same as --yara-rules).
+    if [ "$DO_UPDATE" != true ] && [ -n "$PACKS_SPEC" ]; then
+        YARA_RULES_SPEC="$PACKS_SPEC"
+    fi
+
     # --update is a standalone action (like typical AV tools separate
     # update from scan): update signatures, then exit, no auto-scan.
     if [ "$DO_UPDATE" = true ]; then
@@ -4589,7 +5382,23 @@ main() {
         # will use, as a sanity check that nothing broke in the update.
         local tmp_compile_dir
         tmp_compile_dir=$(mktemp -d "${TMPDIR:-/tmp}/av_update_compile.XXXXXX" 2>/dev/null || mktemp -d)
-        compile_signatures "$SIGNATURES" "$tmp_compile_dir"
+        if [ -n "$PACKS_SPEC" ]; then
+            # --packs hosting,server,all : one pack per comma-separated entry
+            # (each entry may itself be a category: --packs hosting,webshell).
+            # All of them end up side by side in .cache/packs/ — one archive.
+            local pk first=true
+            for pk in $(printf '%s' "$PACKS_SPEC" | tr ',' ' '); do
+                YARA_RULES_SPEC="$pk"; YARA_CATS=""
+                echo -e "${B}[*] ===== pack '$pk' =====${Z}"
+                [ "$first" = true ] || DO_UPDATE=false   # only the first pack invalidates the others
+                compile_signatures "$SIGNATURES" "$tmp_compile_dir"
+                first=false
+                rm -rf "$tmp_compile_dir"; mkdir -p "$tmp_compile_dir"
+            done
+            echo -e "${G}[OK] Packs in $SIGNATURES/.cache/packs/: $(ls "$SIGNATURES/.cache/packs" 2>/dev/null | tr '\n' ' ')${Z}"
+        else
+            compile_signatures "$SIGNATURES" "$tmp_compile_dir"
+        fi
         rm -rf "$tmp_compile_dir"
 
         echo -e "${C}[*] Update finished. Auto-scan after --update is disabled — run a scan as a separate command.${Z}"
@@ -4767,7 +5576,7 @@ USE_RAM="${25:-true}"          # prefer /dev/shm for archive extraction too
 GREP_BIN="${26:-}"             # bundled static grep — see MODULE below
 SUID_VERIFY_MODE="${27:-false}" # dpkg/rpm checksum verify for SUID/SGID —
                                  # off by default, on for -w (real-time)
-YARA_TIMEOUT_SEC="${28:-30}"    # abort a single yara call after this long
+YARA_TIMEOUT_SEC="${28:-300}"    # abort a single yara call after this long
                                  # (yara's own -a flag) — see global comment
 LONG_TIME_MODE="${29:-false}"   # -L/--long-time: log slow batches
 LONG_TIME_THRESHOLD_SEC="${30:-20}"
@@ -5953,7 +6762,7 @@ _archive_batch_yara_check() {
     # despite high CPU%, not genuine parallel speedup. -p 1 makes each
     # yara call single-threaded; the worker-process level (-j) is where
     # parallelism should live, not duplicated inside every yara call too.
-    local yflags=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC")
+    local yflags=(-d filename= -d filepath= -d extension= -p "${YARA_THREADS:-1}" -a "$YARA_TIMEOUT_SEC")
     case "$YARA_TARGET" in *.yarc) yflags+=(-C) ;; esac
 
     local yara_out
@@ -5961,7 +6770,9 @@ _archive_batch_yara_check() {
         local listfile
         listfile=$(mktemp 2>/dev/null) || return
         printf '%s\n' "$@" > "$listfile"
+        _yslot_acq
         yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yflags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        _yslot_rel
         rm -f "$listfile"
     else
         local tmpdir2
@@ -5971,7 +6782,9 @@ _archive_batch_yara_check() {
             ln -sf "$f" "$tmpdir2/$(basename "$f")_$RANDOM" 2>/dev/null
         done
         local raw
+        _yslot_acq
         raw=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yflags[@]}" -r "$YARA_TARGET" "$tmpdir2" 2>/dev/null)
+        _yslot_rel
         if [ -n "$raw" ]; then
             yara_out=$(while IFS= read -r l; do
                 [ -z "$l" ] && continue
@@ -6323,16 +7136,21 @@ _yara_bisect_slow_batch() {
     # --deep exists to no longer skip. Now always proportional, same 1/4
     # ratio regardless of how high YARA_TIMEOUT_SEC is set (so raising
     # --yara-timeout, or --deep's own bump below, actually helps here too).
-    local short_timeout=$(( YARA_TIMEOUT_SEC / 4 ))
+    # Per-file retry gets the FULL configured timeout (default 300s): a
+    # 1/4 ratio gave ~7s and produced masses of SCAN_TIMEOUT on big but
+    # legitimate files. Only the one slow file pays, never the batch.
+    local short_timeout=$YARA_TIMEOUT_SEC
     [ "$short_timeout" -lt 2 ] && short_timeout=2
 
-    local yflags2=(-d filename= -d filepath= -d extension= -p 1 -a "$short_timeout")
+    local yflags2=(-d filename= -d filepath= -d extension= -p "${YARA_THREADS:-1}" -a "$short_timeout")
     case "$YARA_TARGET" in *.yarc) yflags2+=(-C) ;; esac
 
     local f t0 t1 out
     for f in "$@"; do
         t0=$(_now_ms)
+        _yslot_acq
         out=$(timeout $(( short_timeout + 2 )) $YARA_CMD "${yflags2[@]}" "$YARA_TARGET" "$f" 2>/dev/null)
+        _yslot_rel
         local frc=$?
         t1=$(_now_ms)
         if [ "$frc" -ge 128 ]; then
@@ -6382,11 +7200,37 @@ _ram_gate() {
     return 0
 }
 
+# Counting semaphore for concurrent yara processes (see _yara_ram_cap).
+# mkdir is atomic; the owner PID is stored so slots of dead workers are reclaimed.
+_YSLOT=""
+_yslot_acq() {
+    local n="${YARA_SLOTS:-0}" i d pid
+    [ "$n" -ge 1 ] 2>/dev/null || return 0
+    [ "$n" -ge "${WORKERS:-$n}" ] 2>/dev/null && [ "${YARA_THREADS:-1}" -le 1 ] && return 0
+    mkdir -p "$REPORT_DIR/.yslots" 2>/dev/null
+    while :; do
+        i=1
+        while [ "$i" -le "$n" ]; do
+            d="$REPORT_DIR/.yslots/$i"
+            if mkdir "$d" 2>/dev/null; then echo $$ > "$d/pid"; _YSLOT="$d"; return 0; fi
+            pid=$(cat "$d/pid" 2>/dev/null)
+            if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$d" 2>/dev/null; continue; fi
+            i=$(( i + 1 ))
+        done
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+}
+_yslot_rel() {
+    local rc=$?
+    [ -n "$_YSLOT" ] && { rm -rf "$_YSLOT" 2>/dev/null; _YSLOT=""; }
+    return $rc
+}
+
 process_yara_batch() {
     [ $# -eq 0 ] || [ "$HAS_YARA" = false ] || [ "$YARA_CMD" = "none" ] && return
     _ram_gate
 
-    local yara_out yrc yara_flags=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC")
+    local yara_out yrc yara_flags=(-d filename= -d filepath= -d extension= -p "${YARA_THREADS:-1}" -a "$YARA_TIMEOUT_SEC")
     # A compiled ruleset (.yarc) MUST be loaded with -C, or yara tries to
     # parse the binary as rule *source* and fails outright.
     case "$YARA_TARGET" in
@@ -6414,7 +7258,9 @@ process_yara_batch() {
         # timeout. Wrap with the shell's own `timeout` (SIGTERM then
         # SIGKILL at the OS level) as a HARD guarantee that doesn't depend
         # on yara's internal timeout logic working correctly at all.
+        _yslot_acq
         yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        _yslot_rel
         yrc=$?
         local t1; t1=$(_now_ms)
         rm -f "$listfile"
@@ -6452,7 +7298,9 @@ process_yara_batch() {
         for f in "$@"; do
             ln -sf "$f" "$tmpdir/$(bb basename "$f" 2>/dev/null || basename "$f")_$RANDOM" 2>/dev/null
         done
+        _yslot_acq
         yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags[@]}" -r "$YARA_TARGET" "$tmpdir" 2>/dev/null)
+        _yslot_rel
         # Symlink names don't map back to real paths 1:1 in this fallback
         # path (RANDOM-suffixed to avoid collisions) — resolve via readlink.
         if [ -n "$yara_out" ]; then
@@ -6618,9 +7466,11 @@ _check_b64_payload() {
         local dtype="SCRIPT"
         case "$magic" in 7f454c46*) dtype="ELF" ;; 4d5a*) dtype="PE_MZ" ;; esac
         if [ "$HAS_YARA" = true ]; then
-            local yara_flags3=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC") yhit
+            local yara_flags3=(-d filename= -d filepath= -d extension= -p "${YARA_THREADS:-1}" -a "$YARA_TIMEOUT_SEC") yhit
             case "$YARA_TARGET" in *.yarc) yara_flags3+=(-C) ;; esac
+            _yslot_acq
             yhit=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags3[@]}" "$YARA_TARGET" "$b64tmp" 2>/dev/null | head -1 | awk '{print $1}')
+            _yslot_rel
             [ -n "$yhit" ] && threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|yara=${yhit}|b64=${chunk:0:20}..."
         else
             threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|b64=${chunk:0:20}..."
