@@ -66,3 +66,4 @@ rule=php_malfunctions[|][^|]*(/ace/mode-|/vim/vim[0-9]+/autoload/phpcomplete)
 [|][^|]*/var/www/(httpd-logs|www-root/data/logs)/
 
 rule=s_Xls_Macro_SYLKAgent_[A-Za-z0-9_]*[|][^|]*[.](js|cjs|mjs|map|htm)$
+rule=Bolonyokte[|][^|]*/var/lib/containerd/
