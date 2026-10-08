@@ -233,6 +233,16 @@
 #                            from your host's rescue/recovery boot (every
 #                            major provider offers one — the practical
 #                            cloud-VPS equivalent of a LiveCD).
+#                            ALSO compares every boot/vmlinuz-* with a list of
+#                            known kernel builds (signatures/kernel_refs/*.tsv,
+#                            one file per distribution: ubuntu.tsv shipped; Debian
+#                            via tools/gen_kernel_refs.sh, AlmaLinux/Rocky/CentOS via
+#                            tools/gen_kernel_refs_rpm.py - both read the
+#                            distribution's own packages). This needs no dpkg, so it also works from
+#                            a rescue system that is not Debian/Ubuntu, and it
+#                            does not trust the checksums stored on the inspected
+#                            disk. Verdicts: OK / MISMATCH (known name, wrong
+#                            content) / RENAMED / UNKNOWN (not in the list).
 #   --offline-root PATH       Point every check (including -K, and the
 #                            normal file scan via -d) at a MOUNTED, NOT
 #                            BOOTED disk instead of the live filesystem —
@@ -2665,7 +2675,7 @@ compile_signatures() {
     # immune to unrelated files appearing alongside it.
     local newest_src=""
     if [ -d "$sig_input" ]; then
-        newest_src=$(bb find "$sig_input" -mindepth 1 -not -path '*/.cache/*' \
+        newest_src=$(bb find "$sig_input" -mindepth 1 -not -path '*/.cache/*' -not -path '*/kernel_refs*' \
             -not -name "ignore_sigs" -not -name ".incremental_cache.tsv" \
             -newer "$compiled_flag" -print -quit 2>/dev/null)
     fi
@@ -2735,6 +2745,7 @@ EOF
             -not -path '*/yara/*' \
             -not -path '*/custom/*' \
             -not -path '*/.cache/*' \
+            -not -path '*/kernel_refs/*' \
             -not -name "*.pack" -not -name "*.idx" -not -name "*.cvd" \
             -not -name "*.yarc" -not -name "*.compiled" \
             -not -name "*.yar" -not -name "*.yara" \
@@ -3802,6 +3813,56 @@ scan_processes() {
 CHECK_KERNEL=false     # -K/--check-kernel
 OFFLINE_ROOT=""         # --offline-root PATH — see module comment above
 
+# Compares every boot/vmlinuz-* with a list of KNOWN kernel builds shipped in
+# signatures/kernel_refs/*.tsv (made by tools/gen_kernel_refs.sh from the
+# distribution's own packages: hash<TAB>file<TAB>package<TAB>version<TAB>suite,
+# hash = md5 (deb) or sha256 (rpm), told apart by length).
+# Unlike the dpkg-based check below this needs no package manager and no
+# trust in the checksums stored on the inspected disk — a rescue system such as
+# SystemRescue (no dpkg) can run it, and a rootkit that also rewrote the
+# disk's own dpkg md5sums cannot hide a modified kernel from it.
+# Verdicts: match = OK; file name is a known kernel but the md5 matches none
+# of its known builds = MISMATCH (strong); md5 known under another name =
+# RENAMED; name not in the list = UNKNOWN (custom/other distro — look, not proof).
+KREF_FINDINGS=0
+scan_kernel_refs() {
+    local root="${OFFLINE_ROOT:-}" refdir="${SIGNATURES}/kernel_refs" f name md5 sha res verdict a b
+    KREF_FINDINGS=0
+    if ! ls "$refdir"/*.tsv >/dev/null 2>&1; then
+        echo -e "${Y}[INFO] No kernel reference list (${refdir}/*.tsv) -> skipping the known-kernel comparison${Z}"
+        return
+    fi
+    local nref; nref=$(cat "$refdir"/*.tsv 2>/dev/null | grep -vc '^#')
+    echo -e "${B}[*] Comparing boot kernels with ${nref} known kernel builds...${Z}"
+    local seen=0
+    for f in "${root}/boot"/vmlinuz-*; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        seen=$((seen + 1))
+        name="${f##*/}"
+        md5=$(md5sum "$f" 2>/dev/null | cut -d' ' -f1)
+        sha=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+        [ -n "$md5" ] || continue
+        # the first column is an md5 (32 hex, deb packages) or a sha256 (64 hex,
+        # rpm packages) — a file matches when either of its hashes is listed
+        res=$(cat "$refdir"/*.tsv 2>/dev/null | awk -F'\t' -v h="$md5" -v h2="$sha" -v n="$name" '
+            /^#/ { next }
+            ($1 == h || $1 == h2) && $2 == n { ok = $3 " " $4 }
+            ($1 == h || $1 == h2) && $2 != n { other = $2 " (" $3 " " $4 ")" }
+            $2 == n { known = 1 }
+            END { if (ok != "") print "OK\t" ok; else if (other != "") print "RENAMED\t" other; else if (known) print "MISMATCH"; else print "UNKNOWN" }')
+        verdict="${res%%$'\t'*}"; a="${res#*$'\t'}"
+        case "$verdict" in
+            OK)       echo -e "${G}[OK] ${f} = ${a} (matches the distribution's package)${Z}" ;;
+            MISMATCH) echo -e "${R}[!] [KERNEL_REF_MISMATCH] ${f} — '${name}' is a known kernel, but this file's md5 (${md5}) matches NONE of its known builds${Z}"
+                      KREF_FINDINGS=$((KREF_FINDINGS + 1)) ;;
+            RENAMED)  echo -e "${Y}[!] [KERNEL_REF_RENAMED] ${f} — content equals ${a}, but the file has a different name${Z}"
+                      KREF_FINDINGS=$((KREF_FINDINGS + 1)) ;;
+            *)        echo -e "${Y}[?] [KERNEL_REF_UNKNOWN] ${f} (md5 ${md5}) — not in the list: custom kernel, another distribution, or newer/older than the list${Z}" ;;
+        esac
+    done
+    [ "$seen" -eq 0 ] && echo -e "${Y}[INFO] No boot/vmlinuz-* regular files found under ${root:-/}boot${Z}"
+}
+
 scan_kernel_integrity() {
     local root="${OFFLINE_ROOT:-}"
     echo -e "${B}[*] Checking kernel/boot file integrity...${Z}"
@@ -3813,15 +3874,17 @@ scan_kernel_integrity() {
         echo -e "       disk read-only, and re-run with --offline-root.${Z}"
     fi
 
+    scan_kernel_refs
+
     if ! command -v dpkg &>/dev/null; then
-        echo -e "${Y}[WARN] dpkg not found -> can't cross-check against package records, skipping${Z}"
+        echo -e "${Y}[WARN] dpkg not found -> can't cross-check against the disk's package records (the known-kernel comparison above does not need it)${Z}"
         return
     fi
 
     local dpkg_root_arg=()
     [ -n "$root" ] && dpkg_root_arg=(--root="$root")
 
-    local found=0 pkg md5file relpath expected actual f
+    local found=$KREF_FINDINGS pkg md5file relpath expected actual f
     # Every /boot and /lib/modules file that dpkg -S can attribute to a
     # package gets its checksum cross-checked against that package's own
     # record. Files it can't attribute at all (not owned by any package —
