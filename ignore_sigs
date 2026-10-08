@@ -64,3 +64,5 @@ rule=php_malfunctions[|][^|]*(/ace/mode-|/vim/vim[0-9]+/autoload/phpcomplete)
 # --- not executable content: database files and web-server access logs ---
 [|][^|]*/var/lib/mysql[^|]*[.](ibd|MYI|MYD|frm)$
 [|][^|]*/var/www/(httpd-logs|www-root/data/logs)/
+
+rule=s_Xls_Macro_SYLKAgent_[A-Za-z0-9_]*[|][^|]*[.](js|cjs|mjs|map|htm)$
