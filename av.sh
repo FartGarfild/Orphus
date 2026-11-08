@@ -84,9 +84,13 @@
 #                            (auto-created with a commented template).
 #                            Also applied: signatures/ignore_sigs.upstream,
 #                            the shared list from the project repository
-#                            (main branch), refreshed by every -u. Keep your
-#                            own lines in ignore_sigs. Other source / off:
-#                            env ORPHUS_IGNORE_SIGS_URL=<url> | none.
+#                            (Oprhus-patched branch), refreshed by every -u,
+#                            together with shared signatures
+#                            (custom/orphus-shared.sha256,
+#                            yara/orphus-shared/orphus.yar). Keep your own
+#                            lines in ignore_sigs. Other source / off: env
+#                            ORPHUS_REPO_URL=<raw base url> | none
+#                            (ORPHUS_IGNORE_SIGS_URL for the list alone).
 #   signatures/yara_exclude   (optional file, no flag) YARA rule FILES to
 #                            leave out of compilation entirely, one name or
 #                            glob per line (# comments). Unlike ignore_sigs
@@ -2333,7 +2337,13 @@ EOF
     fi
 }
 
-# Shared ignore list from the project repository (main branch), refreshed on
+# Shared data from the project repository (Oprhus-patched branch, always the
+# freshest), refreshed on every -u:
+#   signatures/ignore_sigs                       -> ignore_sigs.upstream
+#   signatures/custom/orphus-shared.sha256       -> same path here
+#   signatures/yara/orphus-shared/orphus.yar     -> same path here
+#   ORPHUS_REPO_URL=<raw base url> | none        other source / switch all off
+# Shared ignore list from the project repository, refreshed on
 # every -u into signatures/ignore_sigs.upstream. Workers apply it IN ADDITION
 # to the local signatures/ignore_sigs, which stays yours and is never touched.
 #   ORPHUS_IGNORE_SIGS_URL=<url>   other source (a mirror, a fork)
@@ -2342,18 +2352,73 @@ EOF
 # ERE, and a line that would hide detections in an ordinary site path
 # (canary test below) is dropped: one careless commit upstream cannot blind
 # every scanner that pulls the list. --deep ignores all of it anyway.
-IGNORE_SIGS_UPSTREAM_URL_DEFAULT="https://raw.githubusercontent.com/FartGarfild/Orphus/main/ignore_sigs"
+ORPHUS_REPO_URL_DEFAULT="https://raw.githubusercontent.com/FartGarfild/Orphus/Oprhus-patched"
+_orphus_repo_url() {
+    local u="${ORPHUS_REPO_URL-$ORPHUS_REPO_URL_DEFAULT}"
+    [ "$u" = none ] && u=""
+    printf '%s' "${u%/}"
+}
 _ignore_sigs_upstream_url() {
-    local u="${ORPHUS_IGNORE_SIGS_URL-$IGNORE_SIGS_UPSTREAM_URL_DEFAULT}"
+    local b u
+    b=$(_orphus_repo_url)
+    u="${ORPHUS_IGNORE_SIGS_URL-${b:+$b/signatures/ignore_sigs}}"
     [ "$u" = none ] && u=""
     printf '%s' "$u"
+}
+
+# Shared signatures (hashes + YARA rules from real incidents). A bad or
+# failed download keeps the previous copy; hash lines must be
+# "<64 hex><TAB><name>", the YARA file may not "include" anything and must
+# compile when yarac is available.
+update_shared_signatures() {
+    local sig_dir="$1" base tmp ok bad n
+    base=$(_orphus_repo_url)
+    [ -n "$base" ] || { echo "  - shared signatures: disabled (ORPHUS_REPO_URL=none)"; return 0; }
+    echo "[*] Shared signatures (project repository)..."
+    mkdir -p "$sig_dir/custom" "$sig_dir/yara/orphus-shared"
+    # hashes
+    tmp=$(mktemp "$sig_dir/custom/.shared.dl.XXXXXX" 2>/dev/null) || return 0
+    net_fetch "$base/signatures/custom/orphus-shared.sha256" "$tmp" 15 "" 5 >/dev/null 2>&1
+    if [ -s "$tmp" ] && ! bb head -c 2000 "$tmp" | bb grep -qiE '<(html|!doctype)'; then
+        bb tr -d '\r' < "$tmp" | bb grep -E $'^[0-9a-f]{64}\t[A-Za-z0-9._-]+$' > "$tmp.ok"
+        ok=$(bb wc -l < "$tmp.ok" | tr -d ' '); bad=$(( $(bb grep -c . "$tmp") - ok ))
+        if [ "$ok" -gt 0 ]; then
+            mv -f "$tmp.ok" "$sig_dir/custom/orphus-shared.sha256"
+            echo "  ✓ shared hashes: $ok"
+        else
+            rm -f "$tmp.ok"; echo "  ! shared hashes: no valid line -> keeping the previous copy"
+        fi
+        [ "$bad" -gt 0 ] && echo -e "  ${Y}[WARN] ${bad} malformed hash line(s) left out${Z}"
+    else
+        echo "  ! shared hashes: download failed -> keeping the previous copy"
+    fi
+    rm -f "$tmp" "$tmp.ok"
+    # YARA rules
+    tmp=$(mktemp "$sig_dir/yara/orphus-shared/.dl.XXXXXX" 2>/dev/null) || return 0
+    net_fetch "$base/signatures/yara/orphus-shared/orphus.yar" "$tmp" 15 "" 5 >/dev/null 2>&1
+    detect_yarac
+    if [ ! -s "$tmp" ] || bb head -c 2000 "$tmp" | bb grep -qiE '<(html|!doctype)'; then
+        echo "  ! shared YARA rules: download failed -> keeping the previous copy"
+    elif bb grep -qE '^[[:space:]]*include[[:space:]]' "$tmp"; then
+        echo -e "  ${Y}[WARN] shared YARA rules contain 'include' -> rejected, keeping the previous copy${Z}"
+    elif [ -n "$YARAC_BIN" ] && ! "$YARAC_BIN" "$tmp" /dev/null >/dev/null 2>&1; then
+        echo -e "  ${Y}[WARN] shared YARA rules do not compile -> rejected, keeping the previous copy${Z}"
+    elif ! bb grep -qE '^[[:space:]]*((private|global)[[:space:]]+)*rule[[:space:]]' "$tmp"; then
+        echo "  ! shared YARA rules: no rule in the file -> keeping the previous copy"
+    else
+        n=$(bb grep -cE '^[[:space:]]*((private|global)[[:space:]]+)*rule[[:space:]]' "$tmp")
+        mv -f "$tmp" "$sig_dir/yara/orphus-shared/orphus.yar"
+        echo "  ✓ shared YARA rules: $n"
+    fi
+    rm -f "$tmp"
+    return 0
 }
 update_ignore_sigs_upstream() {
     local sig_dir="$1" url dest tmp ok=0 badre=0 broad=0 p
     url=$(_ignore_sigs_upstream_url)
     dest="$sig_dir/ignore_sigs.upstream"
     if [ -z "$url" ]; then
-        echo "  - shared ignore list: disabled (ORPHUS_IGNORE_SIGS_URL=none)"
+        echo "  - shared ignore list: disabled (ORPHUS_REPO_URL / ORPHUS_IGNORE_SIGS_URL = none)"
         return 0
     fi
     echo "[*] Shared ignore list (ignore_sigs from the project repository)..."
@@ -2644,6 +2709,7 @@ update_signatures() {
     rm -f "$yara_dir/index.yar" "$yara_dir/rules.yarc" 2>/dev/null   # stale output of older versions
 
     update_ignore_sigs_upstream "$sig_dir"
+    update_shared_signatures "$sig_dir"
 
     # 5. Custom boilerplate
     local custom_dir="$sig_dir/custom"
@@ -6418,7 +6484,16 @@ print_report() {
         bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
             | bb grep -v "^THREAT:WORLD_WRITABLE_EXEC|" | bb awk '!(/^THREAT:SUID_SGID[|]/ && !/TAMPERED/)' \
             | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?' \
-            | while IFS='|' read -r type file info; do
+            | while IFS= read -r line; do
+                # "TYPE|path|info": the path may itself contain "|", so the
+                # info starts at the first "|key=" (rule=, name=, perms= ...),
+                # not at the second "|".
+                type="${line%%|*}"; rest="${line#*|}"
+                if [[ "$rest" =~ \|[a-z_]+= ]]; then
+                    file="${rest%%"${BASH_REMATCH[0]}"*}"; info="${rest#"$file|"}"
+                else
+                    file="${rest%|*}"; info="${rest##*|}"
+                fi
                 # printf %s, not echo -e: a name containing a literal "\n"
                 # (or "\r", "\033[...") must not become a forged line.
                 printf ' %b[!]%b [%b%s%b] %s %b%s%b\n' "$R" "$Z" "$Y" "$type" "$Z" "$file" "$C" "${info:-}" "$Z"

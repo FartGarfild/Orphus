@@ -67,3 +67,18 @@ rule=php_malfunctions[|][^|]*(/ace/mode-|/vim/vim[0-9]+/autoload/phpcomplete)
 
 rule=s_Xls_Macro_SYLKAgent_[A-Za-z0-9_]*[|][^|]*[.](js|cjs|mjs|map|htm)$
 rule=Bolonyokte[|][^|]*/var/lib/containerd/
+
+rule=EquationGroup_porkserver[A-Za-z0-9_]*[|][^|]*/usr/sbin/inetd$
+rule=LinuxHacktool_eyes_screen[|][^|]*/usr/bin/screen$
+
+rule=Scarhikn(Strings)?[|]
+rule=JavaDeploymentToolkit[|][^|]*/plugindetect\.js$
+rule=multiple_versions[|][^|]*\.pdf$
+rule=(scriptkiddies|Bolonyokte)[|][^|]*(/var/lib/awstats/|/awstats\.[^/|]*\.html$)
+rule=EXPL_[A-Za-z0-9_]*[|][^|]*/var/log/
+rule=s_Java_Malware_CVE_2021_44228_[0-9a-z_]*[|][^|]*(/\.acme\.sh/acme\.sh$|/var/lib/apt/lists/)
+rule=with_attachment[|][^|]*/Maildir/
+pattern=/bin/sh -i[|][^|]*/usr/share/locale/[^/]+/LC_MESSAGES/coreutils\.mo$
+rule=(suspicious_version|invalid_xref_numbers|header_evasion)[|][^|]*/usr/share/rspamd/lualib/lua_magic/patterns\.lua$
+# ClamAV hash of the stock Apache default page (also copied to /var/www/html/index.html)
+name=Win\.Malware\.Agent-7761848-0[|]

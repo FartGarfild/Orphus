@@ -5,3 +5,10 @@ quarantine/
 signatures/*
 !signatures/ignore_sigs
 !signatures/kernel_refs/
+# shared signatures, refreshed by -u from this branch
+!signatures/custom/
+signatures/custom/*
+!signatures/custom/orphus-shared.sha256
+!signatures/yara/
+signatures/yara/*
+!signatures/yara/orphus-shared/

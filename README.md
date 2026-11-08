@@ -77,7 +77,7 @@ ClamAV, будучи чудовим рушієм, індексує мільйо�
 - Права файлів (world-writable + виконуваний, напр. 0777) рахуються окремо від загроз: «Permission issues» у підсумку, повний список у `<звіт>-PERMS`, у карантин не потрапляють.
 - SUID/SGID так само мають окремий лічильник і файл `<звіт>-SUID`; загрозою лишається лише `TAMPERED` (контрольна сума не збігається з пакетом). У карантин SUID/SGID не переносяться.
 - Нова евристика `SUSPICIOUS_TMP_EXEC`: приховані виконувані файли/скрипти та будь-які ELF у `/tmp`, `/var/tmp`, `/dev/shm`, `tmp/` сайту. `/dev/shm` тепер сканується (решта `/dev` — ні).
-- `-u` підтягує спільний `ignore_sigs` з гілки `main` у `signatures/ignore_sigs.upstream` (биті й надто широкі рядки відкидаються); твій локальний `signatures/ignore_sigs` не чіпається. Інше джерело або вимкнути: `ORPHUS_IGNORE_SIGS_URL=<url>` / `none`.
+- `-u` підтягує з цієї гілки (`Oprhus-patched`) спільний `ignore_sigs` (у `signatures/ignore_sigs.upstream`) і спільні сигнатури з реальних інцидентів (`signatures/custom/orphus-shared.sha256`, `signatures/yara/orphus-shared/orphus.yar`). Биті рядки, YARA з `include` чи без компіляції відкидаються, лишається попередня копія. Твій локальний `signatures/ignore_sigs` не чіпається. Інше джерело або вимкнути: `ORPHUS_REPO_URL=<url>` / `none`.
 - ARM: автозавантаження busybox поки вимкнене — свій бінарник у `bin/busybox` або `--busybox-url URL`.
 
 ## Встановлення
@@ -112,6 +112,7 @@ git clone <repo> && cd <repo>
 | `build_yara.sh` | збирання YARA з вихідного коду |
 | `signatures.sha256` | шаблон бази сигнатур (формати й приклади) |
 | `signatures/ignore_sigs` | готові виключення відомих хибних спрацювань; береться автоматично |
+| `signatures/custom/orphus-shared.sha256`, `signatures/yara/orphus-shared/orphus.yar` | спільні сигнатури з реальних інцидентів (оновлюються через `-u`) |
 | `signatures/kernel_refs/ubuntu.tsv` | еталонні хеші ядер Ubuntu для `-K` / `--offline-root` |
 | `tools/gen_kernel_refs.py` | генератор `kernel_refs/*.tsv` (ubuntu debian alma rocky centos) |
 
