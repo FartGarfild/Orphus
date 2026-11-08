@@ -5713,7 +5713,11 @@ collect_files() {
     # walked and filtered with -not -path: same file list, but /proc, /sys,
     # the quarantine dir and big -X trees are no longer traversed. Each path
     # P matches as "P" and "P/*". Built into excl=( \( ... \) -prune -o ).
-    local prune=(/proc /sys /dev)
+    # /dev is pruned except /dev/shm: that tmpfs holds regular files, and
+    # droppers/miners hide there (".khp", random-named ELF) because it
+    # leaves nothing on disk. Other scanner instances' own dirs there and
+    # in /tmp are skipped by name.
+    local prune=(/proc /sys)
 
     # Always exclude the scanner's own footprint (install dir, signature
     # dir, quarantine dir, ephemeral work dir, live report file) —
@@ -5778,6 +5782,8 @@ collect_files() {
         [ "${#excl[@]}" -gt 1 ] && excl+=(-o)
         excl+=(-path "$p" -o -path "${p%/}/*")
     done
+    excl+=(-o \( -path '/dev/*' ! -path /dev/shm ! -path '/dev/shm/*' \))
+    excl+=(-o -path '/dev/shm/av_scan_*' -o -path '/dev/shm/av_sigs_*' -o -path '/tmp/av_scan_*')
     excl+=(\) -prune -o)
 
     # FIX (real bug found, pre-existing — not introduced by incremental
@@ -9192,6 +9198,27 @@ check_file_heuristics() {
             case "$real_type" in
                 ELF|PE_MZ|SCRIPT) threat "DISGUISED_FILE" "$file" "ext=.$ext|real=$real_type" ;;
             esac
+            ;;
+    esac
+
+    # Executables in temp dirs (/tmp, /var/tmp, /dev/shm and per-site tmp/,
+    # also inside an offline copy such as /mnt/x/var/tmp): botnet droppers
+    # and miners live there as hidden files (".X11R6", ".khp",
+    # ".cache-jd/javad") or random-named ELF binaries. Reported when
+    #   - any path part below the temp dir starts with "." and the file is
+    #     executable (x bit) or a binary/script (ELF / "#!"), or
+    #   - the file is an ELF binary at all (hidden or not).
+    case "$file" in
+        */tmp/*|*/dev/shm/*)
+            local _tr="${file##*/tmp/}" _ts="${file##*/dev/shm/}" _tt _tx=false _th=false
+            [ "${#_ts}" -lt "${#_tr}" ] && _tr="$_ts"
+            case "/$_tr" in */.*) _th=true ;; esac
+            _tt=$(_bash_file_type "$file")
+            local _to="0000${oct:-0}"; _to="${_to: -4}"
+            (( 8#$_to & 8#0111 )) 2>/dev/null && _tx=true
+            if [ "$_tt" = ELF ] || { [ "$_th" = true ] && { [ "$_tx" = true ] || [ "$_tt" = SCRIPT ]; }; }; then
+                threat "SUSPICIOUS_TMP_EXEC" "$file" "type=${_tt}|hidden=$([ "$_th" = true ] && echo yes || echo no)|perms=${_to}"
+            fi
             ;;
     esac
 
