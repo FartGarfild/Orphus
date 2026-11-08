@@ -6080,7 +6080,7 @@ show_progress() {
         now=$(now_ms)
         elapsed_ms=$(( now - START_MS )); elapsed_s=$(( elapsed_ms / 1000 ))
 
-        local tf=0 tt=0 tpm=0
+        local tf=0 tt=0 tpm=0 tsu=0
         for f in "$WORK_DIR/reports"/pool_*.progress; do
             [ -f "$f" ] || continue
             local fv tv pv
@@ -6088,6 +6088,7 @@ show_progress() {
             tv=$(grep "^THREATS=" "$f" 2>/dev/null | cut -d= -f2)
             pv=$(grep "^PERMS=" "$f" 2>/dev/null | cut -d= -f2)
             tf=$(( tf + ${fv:-0} )); tt=$(( tt + ${tv:-0} )); tpm=$(( tpm + ${pv:-0} ))
+            pv=$(grep "^SUID=" "$f" 2>/dev/null | cut -d= -f2); tsu=$(( tsu + ${pv:-0} ))
         done
 
         local dt=$(( now - prev_ms )) fps=0 avg=0
@@ -6200,7 +6201,7 @@ show_progress() {
 
         printf '\033[5A'
         printf '\033[K'"${B}Time     :${Z} %-8s ${C}Workers : %d/%d${Z}\n" "$efmt" "$active" "$WORKERS"
-        printf '\033[K'"${B}Files    :${Z} %-8d ${tc}${B}Threats : %d${Z}%s\n" "$tf" "$tt" "$([ "$tpm" -gt 0 ] && printf '   Perms : %d' "$tpm")"
+        printf '\033[K'"${B}Files    :${Z} %-8d ${tc}${B}Threats : %d${Z}%s\n" "$tf" "$tt" "$([ "$tpm" -gt 0 ] && printf '   Perms : %d' "$tpm"; [ "$tsu" -gt 0 ] && printf '   SUID : %d' "$tsu")"
         printf '\033[K'"${B}Speed    :${Z} %-8s ${C}RAM     : %s / %s MB (%d%%)${Z}\n" "${fps} f/s" "${mem_mb:-0}" "$MAX_RAM_MB" "$ram_pct"
         printf '\033[K'"${B}Avg Speed:${Z} %-8s ${C}CPU Load: %s${Z}\n" "${avg} f/s" "${cpu_load:-0.00}"
         printf '\033[K'"${B}ETA      :${Z} %s\n" "$eta"
@@ -6300,7 +6301,7 @@ cleanup() {
 # ============================================================================
 build_report() {
     ELAPSED_S=$(( (END_MS - START_MS) / 1000 ))
-    TF=0; TT=0; SC=0; TPERM=0
+    TF=0; TT=0; SC=0; TPERM=0; TSUID=0
     local r f t
     local th_ms=0 ty_ms=0 tu_ms=0 tp_ms=0 v
     for r in "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt; do
@@ -6309,6 +6310,7 @@ build_report() {
         t=$(bb grep "^THREATS_FOUND:" "$r" 2>/dev/null | cut -d: -f2)
         TF=$(( TF + ${f:-0} )); TT=$(( TT + ${t:-0} ))
         v=$(bb grep "^PERMS_FOUND:" "$r" 2>/dev/null | cut -d: -f2); TPERM=$(( TPERM + ${v:-0} ))
+        v=$(bb grep "^SUID_FOUND:" "$r" 2>/dev/null | cut -d: -f2); TSUID=$(( TSUID + ${v:-0} ))
         v=$(bb grep "^TIMING_HASH_MS:" "$r" 2>/dev/null | cut -d: -f2); th_ms=$(( th_ms + ${v:-0} ))
         v=$(bb grep "^TIMING_YARA_MS:" "$r" 2>/dev/null | cut -d: -f2); ty_ms=$(( ty_ms + ${v:-0} ))
         v=$(bb grep "^TIMING_HEUR_MS:" "$r" 2>/dev/null | cut -d: -f2); tu_ms=$(( tu_ms + ${v:-0} ))
@@ -6389,7 +6391,7 @@ build_report() {
  OS / Arch          : $OS / $ARCH
  Target             : $ROOT_DIR
  Files Scanned      : $TF
- Threats Found      : $TT$([ "${TPERM:-0}" -gt 0 ] && printf '\n Permission issues  : %s (not counted as threats; list: %s)' "$TPERM" "${PERMS_REPORT_FILE:-see -o report}")${quarantine_line}${suppressed_line}${skipped_line}${ram_line}
+ Threats Found      : $TT$([ "${TSUID:-0}" -gt 0 ] && printf '\n SUID/SGID files    : %s (not counted as threats; list: %s)' "$TSUID" "${SUID_REPORT_FILE:-see -o report}")$([ "${TPERM:-0}" -gt 0 ] && printf '\n Permission issues  : %s (not counted as threats; list: %s)' "$TPERM" "${PERMS_REPORT_FILE:-see -o report}")${quarantine_line}${suppressed_line}${skipped_line}${ram_line}
  Time Elapsed       : $(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
  Avg Speed          : ${SPEED} files/s
  Workers            : $WORKERS${timing_line}
@@ -6412,23 +6414,23 @@ print_report() {
     echo -e "\n"
     if [ "$TT" -gt 0 ]; then
         echo -e "${R}${RPT}${Z}"
-        local suid_count
-        suid_count=$(bb grep -c "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | bb awk -F: '{s+=$2} END{print s+0}')
         echo -e "\n${R}${B}=== DETECTED THREATS ===${Z}"
         bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
-            | bb grep -vE "^THREAT:(SUID_SGID|WORLD_WRITABLE_EXEC)[|]" \
+            | bb grep -v "^THREAT:WORLD_WRITABLE_EXEC|" | bb awk '!(/^THREAT:SUID_SGID[|]/ && !/TAMPERED/)' \
             | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?' \
             | while IFS='|' read -r type file info; do
                 # printf %s, not echo -e: a name containing a literal "\n"
                 # (or "\r", "\033[...") must not become a forged line.
                 printf ' %b[!]%b [%b%s%b] %s %b%s%b\n' "$R" "$Z" "$Y" "$type" "$Z" "$file" "$C" "${info:-}" "$Z"
               done
-        if [ "${suid_count:-0}" -gt 0 ]; then
-            echo -e "\n ${Y}[i]${Z} ${suid_count} SUID/SGID finding(s) written separately to: ${C}${SUID_REPORT_FILE}${Z}"
-        fi
     else
         echo -e "${G}${RPT}${Z}"
         echo -e "\n ${G}[OK] No threats detected [CLEAN]${Z}"
+    fi
+    local suid_count
+    suid_count=$(bb grep -c "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | bb awk -F: '{s+=$2} END{print s+0}')
+    if [ "${suid_count:-0}" -gt 0 ]; then
+        echo -e "\n ${Y}[i]${Z} ${suid_count} SUID/SGID finding(s) written separately to: ${C}${SUID_REPORT_FILE}${Z} (TAMPERED ones are also listed above as threats)"
     fi
     _print_perms_summary
 }
@@ -6451,7 +6453,7 @@ save_report() {
             # silently did nothing despite looking correct. "-h"
             # suppresses that filename prefix.
             bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
-                | bb grep -vE "^THREAT:(SUID_SGID|WORLD_WRITABLE_EXEC)[|]" \
+                | bb grep -v "^THREAT:WORLD_WRITABLE_EXEC|" | bb awk '!(/^THREAT:SUID_SGID[|]/ && !/TAMPERED/)' \
                 | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?'
         }
     } >&3; exit 0 ) || { echo -e "${Y}[WARN] Can't create ${LIVE_REPORT_FILE} -> report not saved${Z}"; return 0; }
@@ -7082,6 +7084,7 @@ FILES_SCANNED=0
 THREATS_FOUND=0
 SUPPRESSED_FOUND=0
 PERMS_FOUND=0      # permission findings: separate counter, not THREATS_FOUND
+SUID_FOUND=0       # SUID/SGID (not TAMPERED): separate counter as well
 # Coarse per-phase timing (ms), accumulated across all batches this worker
 # processes — reported at the end so a slow scan can be diagnosed (CPU/fork
 # overhead vs disk I/O vs a specific subsystem) instead of guessed at.
@@ -8700,9 +8703,16 @@ threat() {
     printf 'THREAT:%s|%s|%s\n' "${type//$'\n'/?}" "${file//$'\n'/?}" "${info//$'\n'/?}" >> "$REPORT"
     # Permission findings keep the THREAT: line (so -I rescans the file and
     # the report can list it) but count separately and never quarantine.
-    local _perm=false
-    case "$type" in WORLD_WRITABLE_EXEC) _perm=true ;; esac
+    # SUID/SGID: own counter too, unless the package checksum says the
+    # binary was TAMPERED with (that one is a threat). Neither kind is ever
+    # quarantined: moving sudo/passwd/mount away can lock the admin out.
+    local _perm=false _suid=false
+    case "$type" in
+        WORLD_WRITABLE_EXEC) _perm=true ;;
+        SUID_SGID) _suid=true ;;
+    esac
     if [ "$_perm" = true ]; then PERMS_FOUND=$(( PERMS_FOUND + 1 ))
+    elif [ "$_suid" = true ] && [ "${info#*TAMPERED}" = "$info" ]; then SUID_FOUND=$(( SUID_FOUND + 1 ))
     else THREATS_FOUND=$(( THREATS_FOUND + 1 )); fi
     [ "$EXPLAIN_MODE" = true ] && { EXPLAIN_REPORTED=$(( EXPLAIN_REPORTED + 1 )); _xp "  REPORTED    $type | $info"; }
     local _ct=$'\001'-$'\037'
@@ -8721,6 +8731,10 @@ threat() {
         if [ -n "$SUID_REPORT_FILE" ]; then
             printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info" >> "$SUID_REPORT_FILE" 2>/dev/null
         fi
+        # a TAMPERED one is a threat: also in the main live log
+        if [ "${info#*TAMPERED}" != "$info" ] && [ -n "$LIVE_REPORT_FILE" ]; then
+            printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info" >> "$LIVE_REPORT_FILE" 2>/dev/null
+        fi
     elif [ "$_perm" = true ]; then
         [ -n "$PERMS_REPORT_FILE" ] && printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info" >> "$PERMS_REPORT_FILE" 2>/dev/null
     elif [ -n "$LIVE_REPORT_FILE" ]; then
@@ -8731,6 +8745,7 @@ threat() {
     fi
     [ -n "$QUARANTINE_DIR" ] || return 0
     [ "$_perm" = true ] && return 0   # wrong mode is not malware: fix it, don't move it
+    [ "$_suid" = true ] && { log "QUARANTINE_SKIPPED (SUID/SGID binary, report only): $file"; return 0; }
     if [ "$QUARANTINE_SKIP_ARCHIVES" = "true" ]; then
         case "$info" in
             archive_member=*) log "QUARANTINE_SKIPPED (archive container, --no-quarantine-archives): $file"; return 0 ;;
@@ -8740,8 +8755,8 @@ threat() {
 }
 
 progress() {
-    printf 'FILES=%d\nTHREATS=%d\nPERMS=%d\nCURRENT=%s\n' \
-        "$FILES_SCANNED" "$THREATS_FOUND" "$PERMS_FOUND" "${1:-}" > "$PROGRESS"
+    printf 'FILES=%d\nTHREATS=%d\nPERMS=%d\nSUID=%d\nCURRENT=%s\n' \
+        "$FILES_SCANNED" "$THREATS_FOUND" "$PERMS_FOUND" "$SUID_FOUND" "${1:-}" > "$PROGRESS"
 }
 
 # ----------------------------------------------------------------------------
@@ -9720,7 +9735,7 @@ run_yara_consumer() {
 # ----------------------------------------------------------------------------
 finalize_worker() {
     progress "done"
-    printf 'FILES_SCANNED:%d\nTHREATS_FOUND:%d\nSUPPRESSED:%d\nPERMS_FOUND:%d\n' "$FILES_SCANNED" "$THREATS_FOUND" "$SUPPRESSED_FOUND" "$PERMS_FOUND" >> "$REPORT"
+    printf 'FILES_SCANNED:%d\nTHREATS_FOUND:%d\nSUPPRESSED:%d\nPERMS_FOUND:%d\nSUID_FOUND:%d\n' "$FILES_SCANNED" "$THREATS_FOUND" "$SUPPRESSED_FOUND" "$PERMS_FOUND" "$SUID_FOUND" >> "$REPORT"
     printf 'TIMING_HASH_MS:%d\nTIMING_YARA_MS:%d\nTIMING_HEUR_MS:%d\nTIMING_PE_MS:%d\n' "$T_HASH_MS" "$T_YARA_MS" "$T_HEUR_MS" "$T_PE_MS" >> "$REPORT"
     log "Completed - files: $FILES_SCANNED, threats: $THREATS_FOUND, suppressed: $SUPPRESSED_FOUND"
     rm -f "$_IGNORE_SIGS_FILTERED" "$_GENERIC_OBFUSCATION_FILTERED" "$_KNOWN_VENDOR_OBFUSCATION_FILTERED" 2>/dev/null
