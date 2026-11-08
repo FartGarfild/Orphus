@@ -556,7 +556,7 @@
 #   ├── av_scan.sh              [REQUIRED]
 #   ├── bin/
 #   │   ├── busybox              [RECOMMENDED] static busybox binary
-#   │   │                        (x86_64/arm64/armv7, linux-musl static build)
+#   │   │                        (x86_64 linux-musl static build; ARM: bring your own)
 #   │   ├── yara                 [RECOMMENDED] built by `av_scan.sh --setup`
 #   │   └── yarac                (not fetched automatically like busybox —
 #   │                            YARA ships no ready static binaries, so
@@ -1064,8 +1064,9 @@ busybox_url() {
     fi
     case "${OS}_${ARCH}" in
         linux_x86_64) echo "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox" ;;
-        linux_arm64)  echo "https://busybox.net/downloads/binaries/1.35.0-aarch64-linux-musl/busybox" ;;
-        linux_armv7)  echo "https://busybox.net/downloads/binaries/1.35.0-armv7l-linux-musleabihf/busybox" ;;
+        # ARM (arm64/armv7): auto-download DISABLED for now — there is no
+        # verified upstream static build for these. Use -b/--busybox with
+        # your own binary or a mirror URL; otherwise system tools are used.
         *) echo "" ;;
     esac
 }
@@ -1214,6 +1215,10 @@ ensure_busybox() {
 
     local dl_url
     dl_url=$(busybox_url)
+    if [ -z "$dl_url" ]; then
+        echo -e "${Y}[INFO] No busybox auto-download for ${OS}/${ARCH} (ARM builds disabled for now) -> using system tools. Put your own static busybox in bin/busybox or pass --busybox-url URL.${Z}"
+        return 1
+    fi
     # FIX (real bug reported): check_network() as a pre-flight gate here
     # was actively wrong — a person confirmed BOTH the wget --spider AND
     # curl checks it uses succeed (exit 0) when run manually, yet the
