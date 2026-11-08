@@ -2564,26 +2564,14 @@ update_signatures() {
         echo "  ! git not found (outside busybox) -> YARA rule update skipped"
     fi
 
-    if command -v yarac &>/dev/null; then
-        echo "  [*] Compiling YARA rules (may take time)..."
-        local yara_index="$yara_dir/index.yar"
-        local yara_compiled="$yara_dir/rules.yarc"
-        > "$yara_index"
-        find "$yara_dir" -type f \( -name "*.yar" -o -name "*.yara" \) ! -name "index.yar" 2>/dev/null | while read -r yfile; do
-            _yara_file_excluded "$yfile" "$sig_dir/yara_exclude" && continue
-            if yarac "$yfile" /dev/null &>/dev/null; then
-                echo "include \"$yfile\"" >> "$yara_index"
-            fi
-        done
-        if [ -s "$yara_index" ] && yarac "$yara_index" "$yara_compiled" &>/dev/null; then
-            echo "  ✓ YARA compiled -> rules.yarc"
-        else
-            echo "  ! YARA index compile failed -> will use text rules"
-            rm -f "$yara_compiled" 2>/dev/null
-        fi
-    else
-        echo "  ! yarac not found -> text rules only"
+    # Rules are compiled later, per pack, by the signature build step (it uses
+    # bin/yarac from --setup). The old per-file compile here only looked at
+    # $PATH, so it reported "yarac not found" although bin/yarac existed.
+    detect_yarac
+    if [ -z "$YARAC_BIN" ]; then
+        echo "  ! yarac not found -> YARA rules will be used as text (slower; run --setup)"
     fi
+    rm -f "$yara_dir/index.yar" "$yara_dir/rules.yarc" 2>/dev/null   # stale output of older versions
 
     # 5. Custom boilerplate
     local custom_dir="$sig_dir/custom"
@@ -3182,7 +3170,7 @@ _yara_compile_ns() {
             for fn in $(printf '%s\n' "$bad" | bb awk '{print $1}' | bb sort -u); do
                 gf="$ydir/$fn"; [ -f "$gf" ] || continue
                 printf '%s\n' "$bad" | bb awk -v f="$fn" '$1 == f { print $2 }' > "$gf.bad"
-                bb awk -v log="$ydir/dropped_rules.txt" -v f="$fn" 'NR==FNR { d[$1]=1; next } (FNR in d) { print "clamav-too-general\t" f "\tline " FNR >> log; next } { print }' "$gf.bad" "$gf" > "$gf.tmp" && mv -f "$gf.tmp" "$gf"
+                bb awk -v dlog="$ydir/dropped_rules.txt" -v f="$fn" 'NR==FNR { d[$1]=1; next } (FNR in d) { print "clamav-too-general\t" f "\tline " FNR >> dlog; next } { print }' "$gf.bad" "$gf" > "$gf.tmp" && mv -f "$gf.tmp" "$gf"
                 rm -f "$gf.bad" "$gf.tmp"
             done
             continue
