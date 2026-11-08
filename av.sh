@@ -4682,6 +4682,25 @@ extract_setup_module() {
 # ============================================================================
 SCAN_PROCESSES=false   # -P/--scan-processes
 
+# Known-malware names (IOCs), mostly from the "rival killer" lists that
+# Linux miner botnets carry to wipe each other out (one such watchdog —
+# /var/tmp/.X11R6 restarting "javad" — was found on a real hosting server),
+# plus that sample's own files. Used ONLY to report, never to kill or
+# delete: several of those lists also name real daemons (rsyslogd, chronyd,
+# supervisord ...), which here are flagged only when the binary does not
+# live in a system directory.
+# File paths matched anywhere (names no real software uses):
+IOC_PATH_ANY_RE='/(kworkerds[0-9a-z]*|khugepageds|\.?kerberods|systemctI|linuxsys|esocket4|ww4\.sh|\.universal-miner|\.gt_sys_health(\.json)?|\.gt_sys_wd(\.sh)?|\.gt_cron_health(\.json)?|\.sRDQ99i|\.sjo7ucV|427be17e|943fc088|\.auditsd_install_dir|libioset\.so|\.cache-jd|\.salkidwuewerwe|\.mmmjjsdfsdfwerrwerwer|systemxlv|xmrig[^/]*|\.ICEd-unix|\.X11R6|\.xwd|\.khp|\.khp-wdg)(/|$)'
+# Names that are only damning directly in a temp dir (or bin/javad):
+IOC_PATH_TMP_RE='(/(tmp|var/tmp|dev/shm)/(javad|httpgd|gates\.lod|osw\.hb|seasame|z[23]\.sh|xd\.json|wc\.conf|syslogdb?|j2\.conf|\.app\.log|\.syslog[^/]*|ddg)$|/bin/javad$)'
+# Process names: always suspicious (exe basename or argv[0] basename) ...
+IOC_PROC_NAME_RE='^(xmrig.*|linuxsys|esocket4|universal-miner|\.?gt_sys_health|\.?gt_sys_wd.*|\.?gt_cron_health|auditsd|rsysloged|journalctld|systemd-netd|systemd-devd|udev-manager|syslog-helper|kworkerds.*|kerberods|khugepageds|MySvcice|softwaretech|427be17e|943fc088|\.sd-top|javad|javab|javs|ww4.*|\.khp)$'
+# ... anywhere in the command line (long, unique tokens) ...
+IOC_PROC_CMD_RE='(khp-wdg|/\.X11R6|/\.xwd|/\.khp|/\.cache-jd/|universal-miner|xmrig|/linuxsys|/\.zsh( |$)|427be17e|943fc088)'
+# ... and real daemon names that miners borrow: suspicious only outside
+# the system binary directories
+IOC_PROC_DISGUISE_RE='^(rsyslogd|syslog-ng|chronyd|supervisord|supervisor|httpx|unicorn|apt-update|bluetooth-notify|q-start|keeper|rosetta|zzh)$'
+
 scan_processes() {
     echo -e "${B}[*] Scanning running processes for rootkit indicators...${Z}"
     [ -d /proc ] || { echo -e "${Y}[WARN] /proc not available -> skipping process scan${Z}"; return; }
@@ -4735,6 +4754,28 @@ scan_processes() {
                 found=$(( found + 1 ))
             fi
         fi
+
+        # Known miner / botnet names and disguises (report only)
+        local _ex="${exe_link% (deleted)}" _a0 _why=""
+        _a0=$(tr '\0' '\n' < "$pid_dir/cmdline" 2>/dev/null | head -1); _a0="${_a0##*/}"
+        if [[ "${_ex##*/}" =~ $IOC_PROC_NAME_RE ]] || [[ "$_a0" =~ $IOC_PROC_NAME_RE ]]; then
+            _why="known malware name"
+        elif [[ "$cmdline" =~ $IOC_PROC_CMD_RE ]]; then
+            _why="known malware file in command line"
+        elif [[ "${_ex##*/}" =~ $IOC_PROC_DISGUISE_RE ]] || [[ "$_a0" =~ $IOC_PROC_DISGUISE_RE ]]; then
+            case "$_ex" in
+                /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*|/usr/lib/*|/usr/libexec/*|/lib/*|/usr/local/bin/*|/usr/local/sbin/*|/opt/*/bin/*|/snap/*) ;;
+                *) _why="system daemon name, binary outside system dirs" ;;
+            esac
+        fi
+        # a userspace process named like a kernel thread (real kernel threads
+        # have no exe and an empty command line)
+        [ -z "$_why" ] && case "$cmdline" in "["*"]"*) _why="userspace process disguised as a kernel thread" ;; esac
+        [ -z "$_why" ] && case "$_ex" in /tmp/*|/var/tmp/*|/dev/shm/*) _why="running from a temp dir" ;; esac
+        if [ -n "$_why" ]; then
+            echo -e "${R}[!] [PROCESS_SUSPICIOUS] PID=${pid} user=$(bb stat -c %U "$pid_dir" 2>/dev/null) exe=${exe_link} (${_why}) cmdline=${cmdline}${Z}"
+            found=$(( found + 1 ))
+        fi
     done
 
     # --- 2. /proc vs ps cross-check ---
@@ -4765,7 +4806,7 @@ scan_processes() {
     fi
 
     if [ "$found" -eq 0 ]; then
-        echo -e "${G}[OK] No process anomalies detected${Z} (deleted binaries, known-malware hashes, LD_PRELOAD, ps/proc mismatch)"
+        echo -e "${G}[OK] No process anomalies detected${Z} (deleted binaries, known-malware hashes and names, disguised/temp-dir processes, LD_PRELOAD, ps/proc mismatch)"
     else
         echo -e "${Y}[*] ${found} process anomaly(ies) flagged above${Z} — investigate manually; this module cannot auto-quarantine a running process."
     fi
@@ -6809,6 +6850,7 @@ main() {
     # workers: are ClamAV PUA.* hash hits wanted (pack has the "pua" group)?
     case " $CLAM_GROUPS " in *" pua "*) export AV_CLAM_PUA=true ;; *) export AV_CLAM_PUA=false ;; esac
     export AV_MEDIA_FAST="$MEDIA_FAST"
+    export AV_IOC_PATH_ANY_RE="$IOC_PATH_ANY_RE" AV_IOC_PATH_TMP_RE="$IOC_PATH_TMP_RE"
     if [ -n "$(_ignore_sigs_upstream_url)" ] && [ -s "${SIGNATURES}/ignore_sigs.upstream" ]; then
         export AV_IGNORE_UPSTREAM="${SIGNATURES}/ignore_sigs.upstream"
     else
@@ -9200,6 +9242,13 @@ check_file_heuristics() {
             esac
             ;;
     esac
+
+    # Known miner/botnet file names (IOC lists defined in the main script)
+    if [ -n "${AV_IOC_PATH_ANY_RE:-}" ] && [[ "$file" =~ $AV_IOC_PATH_ANY_RE ]]; then
+        threat "KNOWN_MALWARE_PATH" "$file" "ioc=${BASH_REMATCH[1]}|miner/botnet file name"
+    elif [ -n "${AV_IOC_PATH_TMP_RE:-}" ] && [[ "$file" =~ $AV_IOC_PATH_TMP_RE ]]; then
+        threat "KNOWN_MALWARE_PATH" "$file" "ioc=${file##*/}|miner/botnet file name (temp or bin dir)"
+    fi
 
     # Executables in temp dirs (/tmp, /var/tmp, /dev/shm and per-site tmp/,
     # also inside an offline copy such as /mnt/x/var/tmp): botnet droppers
