@@ -82,6 +82,11 @@
 #                            per line, matched against "TYPE|info" of each
 #                            detection. Default: signatures/ignore_sigs
 #                            (auto-created with a commented template).
+#                            Also applied: signatures/ignore_sigs.upstream,
+#                            the shared list from the project repository
+#                            (main branch), refreshed by every -u. Keep your
+#                            own lines in ignore_sigs. Other source / off:
+#                            env ORPHUS_IGNORE_SIGS_URL=<url> | none.
 #   signatures/yara_exclude   (optional file, no flag) YARA rule FILES to
 #                            leave out of compilation entirely, one name or
 #                            glob per line (# comments). Unlike ignore_sigs
@@ -646,6 +651,7 @@ OUTPUT_FILE=""
 LIVE_REPORT_FILE=""    # persistent (outside WORK_DIR) file threats are
                         # appended to AS THEY'RE FOUND, so Ctrl+C/SIGTERM
                         # mid-scan doesn't lose already-detected results
+PERMS_REPORT_FILE=""   # companion file for permission findings (WORLD_WRITABLE_EXEC)
 SUID_REPORT_FILE=""    # companion file for SUID_SGID findings specifically
                         # — set alongside LIVE_REPORT_FILE in init_live_report()
 IGNORE_SIGS_FILE=""    # set in init_ignore_sigs(); patterns (ERE, one per
@@ -2327,6 +2333,67 @@ EOF
     fi
 }
 
+# Shared ignore list from the project repository (main branch), refreshed on
+# every -u into signatures/ignore_sigs.upstream. Workers apply it IN ADDITION
+# to the local signatures/ignore_sigs, which stays yours and is never touched.
+#   ORPHUS_IGNORE_SIGS_URL=<url>   other source (a mirror, a fork)
+#   ORPHUS_IGNORE_SIGS_URL=none    do not download; also stops using the file
+# A failed or bad download keeps the previous copy. Every line must be a valid
+# ERE, and a line that would hide detections in an ordinary site path
+# (canary test below) is dropped: one careless commit upstream cannot blind
+# every scanner that pulls the list. --deep ignores all of it anyway.
+IGNORE_SIGS_UPSTREAM_URL_DEFAULT="https://raw.githubusercontent.com/FartGarfild/Orphus/main/ignore_sigs"
+_ignore_sigs_upstream_url() {
+    local u="${ORPHUS_IGNORE_SIGS_URL-$IGNORE_SIGS_UPSTREAM_URL_DEFAULT}"
+    [ "$u" = none ] && u=""
+    printf '%s' "$u"
+}
+update_ignore_sigs_upstream() {
+    local sig_dir="$1" url dest tmp ok=0 badre=0 broad=0 p
+    url=$(_ignore_sigs_upstream_url)
+    dest="$sig_dir/ignore_sigs.upstream"
+    if [ -z "$url" ]; then
+        echo "  - shared ignore list: disabled (ORPHUS_IGNORE_SIGS_URL=none)"
+        return 0
+    fi
+    echo "[*] Shared ignore list (ignore_sigs from the project repository)..."
+    tmp=$(mktemp "$sig_dir/.ignore_sigs.dl.XXXXXX" 2>/dev/null) || return 0
+    net_fetch "$url" "$tmp" 15 "" 2 >/dev/null 2>&1
+    if [ ! -s "$tmp" ] || bb head -c 2000 "$tmp" | bb grep -qiE '<(html|!doctype)'; then
+        rm -f "$tmp"
+        echo "  ! download failed -> keeping the previous copy$([ -f "$dest" ] || echo ' (none yet)')"
+        return 0
+    fi
+    # canary detections in ordinary site / system locations: no shared line
+    # may hide these
+    local canary
+    canary=$'YARA_MATCH|rule=Orphus_Canary_Rule|/home/user/public_html/index.php\nKNOWN_MALWARE|name=Orphus.Canary-1|md5=0|/var/www/html/wp-config.php\nSIG_STRING_MATCH|pattern=eval(base64_decode(|/home/site/www/upload/shell.php\nHEURISTIC|reason=canary|/tmp/x.php'
+    canary=$(printf '%b' "$canary")
+    {
+        while IFS= read -r p || [ -n "$p" ]; do
+            p="${p%$'\r'}"
+            case "$p" in ''|'#'*|[[:space:]]*'#'*) printf '%s\n' "$p"; continue ;; esac
+            # (busybox grep compiles the regex only once it reads a line)
+            printf 'x\n' | bb grep -E -- "$p" >/dev/null 2>&1
+            if [ $? -eq 2 ]; then badre=$((badre+1)); printf '# [dropped: invalid ERE] %s\n' "$p"; continue; fi
+            if printf '%s\n' "$canary" | bb grep -qE -- "$p" 2>/dev/null; then
+                broad=$((broad+1)); printf '# [dropped: too broad] %s\n' "$p"; continue
+            fi
+            ok=$((ok+1)); printf '%s\n' "$p"
+        done < "$tmp"
+        printf '%s %s %s\n' "$ok" "$badre" "$broad" > "$tmp.cnt"
+    } > "$tmp.ok"
+    read -r ok badre broad < "$tmp.cnt" 2>/dev/null
+    rm -f "$tmp" "$tmp.cnt"
+    { printf '# Downloaded by av.sh -u from %s on %s. Overwritten on every -u:\n# put your own lines in ignore_sigs, not here.\n' "$url" "$(date -u '+%Y-%m-%d %H:%M UTC')"; cat "$tmp.ok"; } > "$tmp.new"
+    rm -f "$tmp.ok"
+    mv -f "$tmp.new" "$dest"
+    echo "  ✓ shared ignore list: ${ok:-0} line(s) -> $dest"
+    [ "${badre:-0}" -gt 0 ] && echo -e "  ${Y}[WARN] ${badre} invalid pattern(s) left out${Z}"
+    [ "${broad:-0}" -gt 0 ] && echo -e "  ${Y}[WARN] ${broad} pattern(s) left out as too broad (would hide detections in ordinary site paths)${Z}"
+    return 0
+}
+
 # Known-vendor-obfuscation allowlist: an ALTERNATIVE to path-based
 # ignore_sigs that works automatically on ANY install, no per-server path
 # configuration needed. If a file matches one of the "generic" YARA rules
@@ -2452,6 +2519,9 @@ init_live_report() {
     # needs to look at. Same base name, "-SUID" appended, next to the
     # main report.
     SUID_REPORT_FILE="${LIVE_REPORT_FILE}-SUID"
+    # Same idea for bad file permissions (0777 and friends on a whole site
+    # tree gives hundreds of lines): own file, own counter, not "threats".
+    PERMS_REPORT_FILE="${LIVE_REPORT_FILE}-PERMS"
 
     # noclobber = O_EXCL: the report is always a NEW file we created, never
     # an existing path (or whatever a symlink planted there points to).
@@ -2572,6 +2642,8 @@ update_signatures() {
         echo "  ! yarac not found -> YARA rules will be used as text (slower; run --setup)"
     fi
     rm -f "$yara_dir/index.yar" "$yara_dir/rules.yarc" 2>/dev/null   # stale output of older versions
+
+    update_ignore_sigs_upstream "$sig_dir"
 
     # 5. Custom boilerplate
     local custom_dir="$sig_dir/custom"
@@ -5510,7 +5582,8 @@ _incremental_sig_stamp() {
     t_c=$(bb stat -c %y "$cdir/.compiled" 2>/dev/null)
     t_p=$(cat "$cdir/packs/$pid/.stamp" 2>/dev/null)
     t_i=$(bb stat -c %y "$IGNORE_SIGS_FILE" 2>/dev/null)
-    printf '%s' "sig=${SIGNATURES}|c=${t_c:-none}|pack=${pid}:${t_p}|ign=${t_i:-none}|m=${MAX_SCAN_MB}|A=${SCAN_ARCHIVES}|deep=${DEEP_MODE}|mf=${MEDIA_FAST}" | tr '\t\n' '  '
+    local t_u=""; [ -n "$(_ignore_sigs_upstream_url)" ] && t_u=$(bb stat -c %y "${SIGNATURES}/ignore_sigs.upstream" 2>/dev/null)
+    printf '%s' "sig=${SIGNATURES}|c=${t_c:-none}|pack=${pid}:${t_p}|ign=${t_i:-none}:${t_u:-none}|m=${MAX_SCAN_MB}|A=${SCAN_ARCHIVES}|deep=${DEEP_MODE}|mf=${MEDIA_FAST}" | tr '\t\n' '  '
 }
 _incremental_cache_valid() {
     local first=""
@@ -5960,13 +6033,14 @@ show_progress() {
         now=$(now_ms)
         elapsed_ms=$(( now - START_MS )); elapsed_s=$(( elapsed_ms / 1000 ))
 
-        local tf=0 tt=0
+        local tf=0 tt=0 tpm=0
         for f in "$WORK_DIR/reports"/pool_*.progress; do
             [ -f "$f" ] || continue
-            local fv tv
+            local fv tv pv
             fv=$(grep "^FILES=" "$f" 2>/dev/null | cut -d= -f2)
             tv=$(grep "^THREATS=" "$f" 2>/dev/null | cut -d= -f2)
-            tf=$(( tf + ${fv:-0} )); tt=$(( tt + ${tv:-0} ))
+            pv=$(grep "^PERMS=" "$f" 2>/dev/null | cut -d= -f2)
+            tf=$(( tf + ${fv:-0} )); tt=$(( tt + ${tv:-0} )); tpm=$(( tpm + ${pv:-0} ))
         done
 
         local dt=$(( now - prev_ms )) fps=0 avg=0
@@ -6079,7 +6153,7 @@ show_progress() {
 
         printf '\033[5A'
         printf '\033[K'"${B}Time     :${Z} %-8s ${C}Workers : %d/%d${Z}\n" "$efmt" "$active" "$WORKERS"
-        printf '\033[K'"${B}Files    :${Z} %-8d ${tc}${B}Threats : %d${Z}\n" "$tf" "$tt"
+        printf '\033[K'"${B}Files    :${Z} %-8d ${tc}${B}Threats : %d${Z}%s\n" "$tf" "$tt" "$([ "$tpm" -gt 0 ] && printf '   Perms : %d' "$tpm")"
         printf '\033[K'"${B}Speed    :${Z} %-8s ${C}RAM     : %s / %s MB (%d%%)${Z}\n" "${fps} f/s" "${mem_mb:-0}" "$MAX_RAM_MB" "$ram_pct"
         printf '\033[K'"${B}Avg Speed:${Z} %-8s ${C}CPU Load: %s${Z}\n" "${avg} f/s" "${cpu_load:-0.00}"
         printf '\033[K'"${B}ETA      :${Z} %s\n" "$eta"
@@ -6179,7 +6253,7 @@ cleanup() {
 # ============================================================================
 build_report() {
     ELAPSED_S=$(( (END_MS - START_MS) / 1000 ))
-    TF=0; TT=0; SC=0
+    TF=0; TT=0; SC=0; TPERM=0
     local r f t
     local th_ms=0 ty_ms=0 tu_ms=0 tp_ms=0 v
     for r in "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt; do
@@ -6187,6 +6261,7 @@ build_report() {
         f=$(bb grep "^FILES_SCANNED:" "$r" 2>/dev/null | cut -d: -f2)
         t=$(bb grep "^THREATS_FOUND:" "$r" 2>/dev/null | cut -d: -f2)
         TF=$(( TF + ${f:-0} )); TT=$(( TT + ${t:-0} ))
+        v=$(bb grep "^PERMS_FOUND:" "$r" 2>/dev/null | cut -d: -f2); TPERM=$(( TPERM + ${v:-0} ))
         v=$(bb grep "^TIMING_HASH_MS:" "$r" 2>/dev/null | cut -d: -f2); th_ms=$(( th_ms + ${v:-0} ))
         v=$(bb grep "^TIMING_YARA_MS:" "$r" 2>/dev/null | cut -d: -f2); ty_ms=$(( ty_ms + ${v:-0} ))
         v=$(bb grep "^TIMING_HEUR_MS:" "$r" 2>/dev/null | cut -d: -f2); tu_ms=$(( tu_ms + ${v:-0} ))
@@ -6267,11 +6342,23 @@ build_report() {
  OS / Arch          : $OS / $ARCH
  Target             : $ROOT_DIR
  Files Scanned      : $TF
- Threats Found      : $TT${quarantine_line}${suppressed_line}${skipped_line}${ram_line}
+ Threats Found      : $TT$([ "${TPERM:-0}" -gt 0 ] && printf '\n Permission issues  : %s (not counted as threats; list: %s)' "$TPERM" "${PERMS_REPORT_FILE:-see -o report}")${quarantine_line}${suppressed_line}${skipped_line}${ram_line}
  Time Elapsed       : $(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
  Avg Speed          : ${SPEED} files/s
  Workers            : $WORKERS${timing_line}
 ================================================="
+}
+
+# Permission findings: counted and listed apart from threats. Console: the
+# number and the 10 directories holding most of them (a "chmod -R 777" on
+# one site is one line here, not hundreds), the full list goes to -PERMS.
+_print_perms_summary() {
+    [ "${TPERM:-0}" -gt 0 ] || return 0
+    echo -e "\n ${Y}[i]${Z} ${TPERM} file(s) with unsafe permissions (world-writable + executable) — not counted as threats${PERMS_REPORT_FILE:+, full list: ${C}${PERMS_REPORT_FILE}${Z}}"
+    bb grep -h "^THREAT:WORLD_WRITABLE_EXEC|" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d'|' -f2 \
+        | bb sed 's|/[^/]*$||' | bb sort | bb uniq -c | bb sort -rn | head -10 | tr '\001-\011\013-\037\177' '?' \
+        | while read -r n d; do printf '     %6s  %s/\n' "$n" "$d"; done
+    echo -e "     fix example: find DIR -type f -perm -0002 -exec chmod o-w {} +   (and chmod a-x for non-scripts)"
 }
 
 print_report() {
@@ -6282,7 +6369,7 @@ print_report() {
         suid_count=$(bb grep -c "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | bb awk -F: '{s+=$2} END{print s+0}')
         echo -e "\n${R}${B}=== DETECTED THREATS ===${Z}"
         bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
-            | bb grep -v "^THREAT:SUID_SGID|" \
+            | bb grep -vE "^THREAT:(SUID_SGID|WORLD_WRITABLE_EXEC)[|]" \
             | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?' \
             | while IFS='|' read -r type file info; do
                 # printf %s, not echo -e: a name containing a literal "\n"
@@ -6296,6 +6383,7 @@ print_report() {
         echo -e "${G}${RPT}${Z}"
         echo -e "\n ${G}[OK] No threats detected [CLEAN]${Z}"
     fi
+    _print_perms_summary
 }
 
 save_report() {
@@ -6316,7 +6404,7 @@ save_report() {
             # silently did nothing despite looking correct. "-h"
             # suppresses that filename prefix.
             bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
-                | bb grep -v "^THREAT:SUID_SGID|" \
+                | bb grep -vE "^THREAT:(SUID_SGID|WORLD_WRITABLE_EXEC)[|]" \
                 | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?'
         }
     } >&3; exit 0 ) || { echo -e "${Y}[WARN] Can't create ${LIVE_REPORT_FILE} -> report not saved${Z}"; return 0; }
@@ -6335,6 +6423,17 @@ save_report() {
             bb grep -h "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?'
         } >&3 ) 2>/dev/null
         echo -e "[*] SUID/SGID report saved: ${C}${SUID_REPORT_FILE}${Z}"
+    fi
+    if [ -n "$PERMS_REPORT_FILE" ] && bb grep -q "^THREAT:WORLD_WRITABLE_EXEC|" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null; then
+        rm -f -- "$PERMS_REPORT_FILE" 2>/dev/null
+        ( set -C; { exec 3> "$PERMS_REPORT_FILE"; } 2>/dev/null || exit 1
+        {
+            echo "# Orphus AV Scanner — files with unsafe permissions (world-writable + executable)"
+            echo "# Not counted as threats. Target: $ROOT_DIR"
+            echo ""
+            bb grep -h "^THREAT:WORLD_WRITABLE_EXEC|" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?'
+        } >&3 ) 2>/dev/null
+        echo -e "[*] Permissions report saved: ${C}${PERMS_REPORT_FILE}${Z}"
     fi
 }
 
@@ -6409,7 +6508,7 @@ _rt_is_self() {
         case "$1" in "$p"|"$p"/*) return 0 ;; esac
     done
     [ "$QUARANTINE_ENABLED" = true ] && [ -n "$QUARANTINE_DIR" ] && case "$1" in "${QUARANTINE_DIR%/}"|"${QUARANTINE_DIR%/}"/*) return 0 ;; esac
-    for p in "$LIVE_REPORT_FILE" "$OUTPUT_FILE" "$SUID_REPORT_FILE"; do
+    for p in "$LIVE_REPORT_FILE" "$OUTPUT_FILE" "$SUID_REPORT_FILE" "$PERMS_REPORT_FILE"; do
         [ -n "$p" ] && [ "$1" = "$p" ] && return 0
     done
     return 1
@@ -6704,6 +6803,11 @@ main() {
     # workers: are ClamAV PUA.* hash hits wanted (pack has the "pua" group)?
     case " $CLAM_GROUPS " in *" pua "*) export AV_CLAM_PUA=true ;; *) export AV_CLAM_PUA=false ;; esac
     export AV_MEDIA_FAST="$MEDIA_FAST"
+    if [ -n "$(_ignore_sigs_upstream_url)" ] && [ -s "${SIGNATURES}/ignore_sigs.upstream" ]; then
+        export AV_IGNORE_UPSTREAM="${SIGNATURES}/ignore_sigs.upstream"
+    else
+        export AV_IGNORE_UPSTREAM=""
+    fi
     _yara_ram_cap "$SIG_DIR/yara/rules.yarc"
     yara_self_test
 
@@ -6920,6 +7024,7 @@ QUARANTINE_DRY_RUN="${42:-false}"  # --quarantine-dry-run: report what
                                  # any file — see quarantine_file() below.
 QUARANTINE_SKIP_ARCHIVES="${43:-false}"  # --no-quarantine-archives
 SUID_REPORT_FILE="${44:-}"     # companion file for SUID_SGID live-stream
+PERMS_REPORT_FILE=""; [ -n "$SUID_REPORT_FILE" ] && PERMS_REPORT_FILE="${SUID_REPORT_FILE%-SUID}-PERMS"
                                  # writes — see threat() for why this needs
                                  # to exist here too, not just in save_report()
 
@@ -6928,6 +7033,7 @@ PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
 FILES_SCANNED=0
 THREATS_FOUND=0
 SUPPRESSED_FOUND=0
+PERMS_FOUND=0      # permission findings: separate counter, not THREATS_FOUND
 # Coarse per-phase timing (ms), accumulated across all batches this worker
 # processes — reported at the end so a slow scan can be diagnosed (CPU/fork
 # overhead vs disk I/O vs a specific subsystem) instead of guessed at.
@@ -7114,6 +7220,10 @@ init_worker_state() {
     # Now safe to filter the pattern files (bb() is defined by this point
     # in the worker — see the NOTE further up where these get declared).
     _filter_patterns_file "$IGNORE_SIGS_FILE" "$_IGNORE_SIGS_FILTERED"
+    # shared list from the repository (see update_ignore_sigs_upstream)
+    if [ -n "${AV_IGNORE_UPSTREAM:-}" ] && [ -s "$AV_IGNORE_UPSTREAM" ]; then
+        bb grep -v '^[[:space:]]*#' "$AV_IGNORE_UPSTREAM" 2>/dev/null | bb grep -v '^[[:space:]]*$' >> "$_IGNORE_SIGS_FILTERED" 2>/dev/null
+    fi
     _filter_patterns_file "$GENERIC_OBFUSCATION_RULES_FILE" "$_GENERIC_OBFUSCATION_FILTERED"
     _filter_patterns_file "$KNOWN_VENDOR_OBFUSCATION_FILE" "$_KNOWN_VENDOR_OBFUSCATION_FILTERED"
 }
@@ -8540,7 +8650,12 @@ threat() {
     # matches its path against find's raw output); every human-facing copy
     # (live report below, save_report/print_report) masks all control chars.
     printf 'THREAT:%s|%s|%s\n' "${type//$'\n'/?}" "${file//$'\n'/?}" "${info//$'\n'/?}" >> "$REPORT"
-    THREATS_FOUND=$(( THREATS_FOUND + 1 ))
+    # Permission findings keep the THREAT: line (so -I rescans the file and
+    # the report can list it) but count separately and never quarantine.
+    local _perm=false
+    case "$type" in WORLD_WRITABLE_EXEC) _perm=true ;; esac
+    if [ "$_perm" = true ]; then PERMS_FOUND=$(( PERMS_FOUND + 1 ))
+    else THREATS_FOUND=$(( THREATS_FOUND + 1 )); fi
     [ "$EXPLAIN_MODE" = true ] && { EXPLAIN_REPORTED=$(( EXPLAIN_REPORTED + 1 )); _xp "  REPORTED    $type | $info"; }
     local _ct=$'\001'-$'\037'
     local m_type="${type//[$_ct$'\177']/?}" m_file="${file//[$_ct$'\177']/?}" m_info="${info//[$_ct$'\177']/?}"
@@ -8558,6 +8673,8 @@ threat() {
         if [ -n "$SUID_REPORT_FILE" ]; then
             printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info" >> "$SUID_REPORT_FILE" 2>/dev/null
         fi
+    elif [ "$_perm" = true ]; then
+        [ -n "$PERMS_REPORT_FILE" ] && printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info" >> "$PERMS_REPORT_FILE" 2>/dev/null
     elif [ -n "$LIVE_REPORT_FILE" ]; then
         # Single printf = single write() syscall = atomic append even with
         # multiple worker processes writing the same file concurrently, as
@@ -8565,6 +8682,7 @@ threat() {
         printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info" >> "$LIVE_REPORT_FILE" 2>/dev/null
     fi
     [ -n "$QUARANTINE_DIR" ] || return 0
+    [ "$_perm" = true ] && return 0   # wrong mode is not malware: fix it, don't move it
     if [ "$QUARANTINE_SKIP_ARCHIVES" = "true" ]; then
         case "$info" in
             archive_member=*) log "QUARANTINE_SKIPPED (archive container, --no-quarantine-archives): $file"; return 0 ;;
@@ -8574,8 +8692,8 @@ threat() {
 }
 
 progress() {
-    printf 'FILES=%d\nTHREATS=%d\nCURRENT=%s\n' \
-        "$FILES_SCANNED" "$THREATS_FOUND" "${1:-}" > "$PROGRESS"
+    printf 'FILES=%d\nTHREATS=%d\nPERMS=%d\nCURRENT=%s\n' \
+        "$FILES_SCANNED" "$THREATS_FOUND" "$PERMS_FOUND" "${1:-}" > "$PROGRESS"
 }
 
 # ----------------------------------------------------------------------------
@@ -9526,7 +9644,7 @@ run_yara_consumer() {
 # ----------------------------------------------------------------------------
 finalize_worker() {
     progress "done"
-    printf 'FILES_SCANNED:%d\nTHREATS_FOUND:%d\nSUPPRESSED:%d\n' "$FILES_SCANNED" "$THREATS_FOUND" "$SUPPRESSED_FOUND" >> "$REPORT"
+    printf 'FILES_SCANNED:%d\nTHREATS_FOUND:%d\nSUPPRESSED:%d\nPERMS_FOUND:%d\n' "$FILES_SCANNED" "$THREATS_FOUND" "$SUPPRESSED_FOUND" "$PERMS_FOUND" >> "$REPORT"
     printf 'TIMING_HASH_MS:%d\nTIMING_YARA_MS:%d\nTIMING_HEUR_MS:%d\nTIMING_PE_MS:%d\n' "$T_HASH_MS" "$T_YARA_MS" "$T_HEUR_MS" "$T_PE_MS" >> "$REPORT"
     log "Completed - files: $FILES_SCANNED, threats: $THREATS_FOUND, suppressed: $SUPPRESSED_FOUND"
     rm -f "$_IGNORE_SIGS_FILTERED" "$_GENERIC_OBFUSCATION_FILTERED" "$_KNOWN_VENDOR_OBFUSCATION_FILTERED" 2>/dev/null
