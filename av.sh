@@ -4749,7 +4749,7 @@ CHECK_KERNEL=false     # -K/--check-kernel
 OFFLINE_ROOT=""         # --offline-root PATH — see module comment above
 
 # Compares every boot/vmlinuz-* with a list of KNOWN kernel builds shipped in
-# signatures/kernel_refs/*.tsv (made by tools/gen_kernel_refs.sh from the
+# signatures/kernel_refs/*.tsv (made by tools/gen_kernel_refs.py from the
 # distribution's own packages: hash<TAB>file<TAB>package<TAB>version<TAB>suite,
 # hash = md5 (deb) or sha256 (rpm), told apart by length).
 # Unlike the dpkg-based check below this needs no package manager and no

@@ -1,0 +1,7 @@
+# runtime output of av.sh, not part of the repo
+av_scan_threats_*.log*
+bin/
+quarantine/
+signatures/*
+!signatures/ignore_sigs
+!signatures/kernel_refs/

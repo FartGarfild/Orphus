@@ -1,0 +1,69 @@
+# Oprhus AV Scanner — ignore_sigs
+#
+# One extended-regex (ERE) pattern per line, matched against
+# "TYPE|info" of each detection (e.g. "YARA_MATCH|rule=WEBSHELL_PHP_Dynamic_Big"
+# or "SIG_STRING_MATCH|pattern=chmod 777"). A match SUPPRESSES that
+# detection entirely — no log entry, no quarantine. Patterns match as
+# substrings, so "WEBSHELL_PHP_Dynamic_Big" also matches
+# "WEBSHELL_PHP_Dynamic_Big_v2" — anchor with ^/$ for an exact match.
+#
+# Use this for signatures/rules that are individually too broad for your
+# specific software (e.g. a CMS that ships obfuscated/encoded core files
+# for license protection — generic webshell-obfuscation heuristics can't
+# tell that apart from an actual backdoor by pattern alone).
+#
+# Examples (uncomment to use):
+# rule=WEBSHELL_PHP_Dynamic_Big
+# rule=WEBSHELL_PHP_Encoded_Big
+pattern=/bin/sh -i.*/sbin/chroot$
+pattern=/bin/sh -i.*nc_openbsd\.1\.gz$
+rule=EXT_WEBSHELL_PHP_Generic.*/vendor/matomo/device-detector/README\.md
+rule=WEBSHELL_PHP_Dynamic_Big.*/extension/csvprice_pro/app_order\.php
+rule=apt_CN_Tetrisplugins_JS.*/revslider/admin/includes/shortcode_generator/gutenberg/dist/blocks\.build\.js
+rule=EXT_WEBSHELL_PHP_Generic.*/mmtrade/filemanager/elFinderConnector\.class\.php
+rule=WEBSHELL_PHP_Generic_Callback.*/mmtrade/filemanager/elFinderConnector\.class\.php
+rule=WEBSHELL_PHP_Dynamic_Big.*/vendor/clue/stream-filter/tests/FunTest\.php
+rule=WEBSHELL_PHP_OBFUSC_3.*/vendor/laravel/framework/src/Illuminate/Cache/PhpRedisLock\.php
+rule=WEBSHELL_PHP_Dynamic_Big.*vendor/spatie/laravel-ignition/src/Recorders/DumpRecorder/MultiDumpHandler\.php$
+rule=php_malfunctions.*/ace/mode-php
+rule=overwrite_globals_hack.*/engine/classes/min/lib/JSMinify\.php$
+
+# ===== Orphus: noise found on real scans (generic YARA/ClamAV indicators on system files) =====
+# Format reminder: the matched string is  TYPE|info|PATH  (info = rule=NAME ...)
+ 
+# --- Generic string/API indicator rules (Yara-Rules "capabilities"/utils): not verdicts ---
+rule=(IsSuspicious|possible_includes_base64_packed_functions|ldpreload|Borland|cred_ff|network_smtp_raw|spreading_file|win_files_operation|network_tcp_listen|network_irc|network_dyndns|network_ssl|network_udp_sock|win_mutex|win_token|cred_local|hijack_network|escalate_priv|lsadump|inject_thread|function_through_object|multiple_versions)[|]
+ 
+# --- PE-feature and compiler-ID helper rules (fire on ANY PE: kernel EFI stub, nmap exe, pip launchers) ---
+rule=(HasRichSignature|IsPE32|IsPE64|IsConsole|IsWindowsGUI|IsPacked|HasOverlay|HasDebugData|HasDigitalSignature|ImportTableIsBad|HasModified_DOS_Message|VC8_Microsoft_Corporation|Microsoft_Visual_Cpp_8|Microsoft_Visual_Cpp_80_DLL|Visual_Cpp_2008_Release_Microsoft|VM_Generic_Detection|Str_Win32_Wininet_Library)[|]
+ 
+# --- maldoc heuristics firing on non-documents ---
+rule=(maldoc_find_kernel32_base_method_1|maldoc_indirect_function_call_3)[|]
+ 
+# --- ClamAV potentially-unwanted-app signatures (ClamAV itself ignores them unless --detect-pua) ---
+rule=s_PUA_
+ 
+# --- ClamAV signatures (PE etc.) on files that are not malware ---
+rule=s_[A-Za-z0-9_]*[|][^|]*/boot/vmlinuz
+rule=s_[A-Za-z0-9_]*[|][^|]*/usr/libexec/fwupd/efi/
+rule=s_[A-Za-z0-9_]*[|][^|]*/var/lib/containerd/
+rule=s_Xls_Macro_SYLKAgent_[A-Za-z0-9_]*[|][^|]*[.](js|map|htm)$
+rule=s_(Pdf_Exploit|Html_Spyware)_[A-Za-z0-9_]*[|][^|]*/usr/local/mgr5/
+rule=s_Java_Malware_[A-Za-z0-9_]*[|][^|]*/usr/local/(bin/wp|mgr5/)
+ 
+# --- nmap ships exploit/shell strings and a Windows psexec service exe by design ---
+[|][^|]*/usr/share/nmap/(scripts|nselib)/
+ 
+# --- single known false positives ---
+rule=LinuxHacktool_eyes_screen[|][^|]*/usr/bin/screen$
+rule=SharedStrings[|][^|]*/libmemcached
+rule=Bolonyokte[|][^|]*/usr/local/mgr5/
+rule=overwrite_globals_hack[|][^|]*/engine/classes/min/lib/JSMinify[.]php$
+rule=php_malfunctions[|][^|]*(/ace/mode-|/vim/vim[0-9]+/autoload/phpcomplete)
+ 
+# --- not executable content: database files and web-server access logs ---
+[|][^|]*/var/lib/mysql[^|]*[.](ibd|MYI|MYD|frm)$
+[|][^|]*/var/www/(httpd-logs|www-root/data/logs)/
+
+rule=s_Xls_Macro_SYLKAgent_[A-Za-z0-9_]*[|][^|]*[.](js|cjs|mjs|map|htm)$
+rule=Bolonyokte[|][^|]*/var/lib/containerd/
