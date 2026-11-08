@@ -78,3 +78,4 @@ rule=(scriptkiddies|Bolonyokte)[|][^|]*(/var/lib/awstats/|/awstats\.[^/|]*\.html
 rule=EXPL_[A-Za-z0-9_]*[|][^|]*/var/log/
 rule=s_Java_Malware_CVE_2021_44228_[0-9a-z_]*[|][^|]*(/\.acme\.sh/acme\.sh$|/var/lib/apt/lists/)
 rule=with_attachment[|][^|]*/Maildir/
+pattern=/bin/sh -i[|][^|]*/usr/share/locale/[^/]+/LC_MESSAGES/coreutils\.mo$
