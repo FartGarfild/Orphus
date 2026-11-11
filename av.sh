@@ -7986,6 +7986,33 @@ _verify_package_file() {
     echo "$result"
 }
 
+# Same detection as _bash_file_type, result in $_FT: no "$(...)" subshell.
+# The scan loop calls this once per file; a fork per file was a large part
+# of the per-file overhead.
+_FT=UNKNOWN
+_ft_set() {
+    local bytes="" hex="" i c ord
+    { IFS= read -r -d '' -n 8 bytes < "$1"; } 2>/dev/null
+    if [ -n "$bytes" ]; then
+        for (( i=0; i<${#bytes}; i++ )); do c="${bytes:$i:1}"; printf -v ord '%02x' "'$c"; hex+="$ord"; done
+    fi
+    [ -z "$hex" ] && hex=$(bb dd if="$1" bs=8 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n')
+    case "$hex" in
+        "")            _FT=EMPTY ;;
+        7f454c46*)     _FT=ELF ;;
+        4d5a*)         _FT=PE_MZ ;;
+        25504446*)     _FT=PDF ;;
+        504b0304*)     _FT=ZIP ;;
+        89504e470d0a*) _FT=PNG ;;
+        ffd8ff*)       _FT=JPEG ;;
+        47494638*)     _FT=GIF ;;
+        1f8b*)         _FT=GZIP ;;
+        425a68*)       _FT=BZIP2 ;;
+        377abcaf*)     _FT=7ZIP ;;
+        2321*)         _FT=SCRIPT ;;
+        *)             _FT=UNKNOWN ;;
+    esac
+}
 _bash_file_type() {
     # PERFORMANCE: this is called on essentially every scanned file (YARA
     # skip_deep decision). The old dd+od pipeline forks 2 external
@@ -8535,7 +8562,7 @@ _archive_batch_hash_check() {
         sig_file="$SIG_DIR/$htype.tsv"
         out=$($cmd "${valid[@]}" 2>/dev/null)
         [ -z "$out" ] && continue
-        hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | sed 's/^\\//' | bb grep -E '^[0-9a-fA-F]+$' | _real_grep -F -f - "$sig_file" 2>/dev/null | cut -f1 | sort -u)
+        hits=$(_hash_lookup "$sig_file" <<< "$out")
         [ -z "$hits" ] && continue
         while IFS= read -r hit_hash; do
             [ -z "$hit_hash" ] && continue
@@ -9078,6 +9105,28 @@ quarantine_file() {
 # ----------------------------------------------------------------------------
 # MODULE: hash matching
 # ----------------------------------------------------------------------------
+# Which of the hashes on stdin are in a signature table ("hash<TAB>name",
+# sorted bytewise by compile_signatures)? Prints the matching hashes.
+# join walks the two sorted lists once: ~50 ms for 200 hashes against
+# 587k md5 lines, where grep -F -f needed ~450 ms per batch. No join (busybox
+# only) or a table that is not sorted -> the old grep.
+HASH_JOIN=""
+_hash_lookup() {
+    local tbl="$1" keys res
+    keys=$(cut -d' ' -f1 | sed 's/^\\//' | bb grep -E '^[0-9a-fA-F]{32,64}$' | sort -u)
+    [ -n "$keys" ] || return 0
+    if [ -z "$HASH_JOIN" ]; then
+        if command -v join &>/dev/null && printf 'a\tb\n' | join -t "$(printf '\t')" --check-order -o 1.1 - /dev/null &>/dev/null; then HASH_JOIN=true; else HASH_JOIN=false; fi
+    fi
+    if [ "$HASH_JOIN" = true ]; then
+        if res=$(join -t "$(printf '\t')" --check-order -o 1.1 - "$tbl" 2>/dev/null <<< "$keys"); then
+            [ -n "$res" ] && printf '%s\n' "$res" | sort -u
+            return 0
+        fi
+        HASH_JOIN=false      # not sorted the way join wants: grep from now on
+    fi
+    _real_grep -F -f - "$tbl" 2>/dev/null <<< "$keys" | cut -f1 | sort -u
+}
 process_hash_batch() {
     local htype="$1" sig_file="$2"
     shift 2
@@ -9108,8 +9157,7 @@ process_hash_batch() {
     # escape newlines, so a name with an empty line became an EMPTY pattern
     # that matched every database line.
     local hits
-    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | sed 's/^\\//' | bb grep -E '^[0-9a-fA-F]{32,64}$' \
-        | _real_grep -F -f - "$sig_file" 2>/dev/null | cut -f1 | sort -u)
+    hits=$(_hash_lookup "$sig_file" <<< "$out")
     if [ -n "$hits" ]; then
         local hit_hash tname ln h f
         while IFS= read -r hit_hash; do
@@ -9509,6 +9557,26 @@ _check_b64_payload() {
     done < <(if _has_real_grep; then _real_grep -oE '[A-Za-z0-9+/]{200,}={0,2}' "$file" 2>/dev/null; else bb grep -oE '[A-Za-z0-9+/]{200,}={0,2}' "$file" 2>/dev/null; fi | head -8)
 }
 
+# The base64 payload check used to start a grep (a regex over the whole
+# file) for EVERY file. Now the files of a batch go through ONE grep that
+# keeps only those holding a base64 run of 200+ characters whose decoded
+# bytes begin with ELF / MZ / "#!" - in base64 that is "f0VMR", "TV[o-r]",
+# "Iy[E-H]" at the start of the run - and only those few reach the decoder
+# (_check_b64_payload), which works exactly as before.
+declare -a BATCH_B64=()
+B64_PRE_RE='(^|[^A-Za-z0-9+/])(f0VMR|TV[o-r]|Iy[E-H])[A-Za-z0-9+/]{195,}'
+_flush_b64_batch() {
+    [ "${#BATCH_B64[@]}" -eq 0 ] && return 0
+    local hit
+    if _has_real_grep; then
+        while IFS= read -r -d '' hit; do
+            [ -n "$hit" ] && _check_b64_payload "$hit"
+        done < <(_real_grep -l -Z -E -e "$B64_PRE_RE" -- "${BATCH_B64[@]}" 2>/dev/null)
+    else
+        for hit in "${BATCH_B64[@]}"; do _check_b64_payload "$hit"; done
+    fi
+    BATCH_B64=()
+}
 check_file_heuristics() {
     local file="$1" size="$2" oct="$3"
 
@@ -9516,7 +9584,8 @@ check_file_heuristics() {
         # REVERTED to always running this own grep-based pass (see the
         # REVERTED comment in compile_signatures for why) — no longer
         # gated on HAS_YARA / a screening rule.
-        _check_b64_payload "$file"
+        BATCH_B64+=("$file")
+        [ "${#BATCH_B64[@]}" -ge "$BATCH_SIZE" ] && _flush_b64_batch
     fi
 
     # Disguised
@@ -9525,7 +9594,7 @@ check_file_heuristics() {
     case "$ext" in
         jpg|jpeg|png|gif|bmp|webp|pdf|doc|docx|xls|xlsx)
             local real_type
-            real_type=$(do_file_type "$file")
+            if [ "$FILE_CMD" = "bash" ]; then _ft_set "$file"; real_type=$_FT; else real_type=$(do_file_type "$file"); fi
             case "$real_type" in
                 ELF|PE_MZ|SCRIPT) threat "DISGUISED_FILE" "$file" "ext=.$ext|real=$real_type" ;;
             esac
@@ -9552,7 +9621,7 @@ check_file_heuristics() {
             local _tr="${file##*/tmp/}" _ts="${file##*/dev/shm/}" _tt _tx=false _th=false
             [ "${#_ts}" -lt "${#_tr}" ] && _tr="$_ts"
             case "/$_tr" in */.*) _th=true ;; esac
-            _tt=$(_bash_file_type "$file")
+            _ft_set "$file"; _tt=$_FT
             local _to="0000${oct:-0}"; _to="${_to: -4}"
             (( 8#$_to & 8#0111 )) 2>/dev/null && _tx=true
             if [ "$_tt" = ELF ] || { [ "$_th" = true ] && { [ "$_tx" = true ] || [ "$_tt" = SCRIPT ]; }; }; then
@@ -9749,6 +9818,7 @@ _flush_batches() {
     if [ "$SHA1_BATCH_CNT" -gt 0 ]; then _timed_hash_batch "sha1" "$SIG_DIR/sha1.tsv" "${BATCH_SHA1[@]}"; BATCH_SHA1=(); SHA1_BATCH_CNT=0; fi
     if [ "$MD5_BATCH_CNT" -gt 0 ]; then _timed_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"; BATCH_MD5=(); MD5_BATCH_CNT=0; fi
     _flush_image_batch
+    _flush_b64_batch
     if [ "$YARA_BATCH_CNT" -gt 0 ]; then _timed_yara_batch "${BATCH_YARA[@]}"; BATCH_YARA=(); YARA_BATCH_CNT=0; fi
     if [ "$HEUR_BATCH_CNT" -gt 0 ]; then _timed_heur_batch "${BATCH_HEUR[@]}"; BATCH_HEUR=(); HEUR_BATCH_CNT=0; fi
     if [ "$PE_BATCH_CNT" -gt 0 ]; then _timed_pe_batch "${BATCH_PE[@]}"; BATCH_PE=(); PE_BATCH_CNT=0; fi
@@ -9836,7 +9906,7 @@ run_scan_loop() {
             fi
 
             # Magic filter + YARA decision
-            magic_type=$(_bash_file_type "$file")
+            _ft_set "$file"; magic_type=$_FT
             skip_deep=false
             # Skip full YARA only when BOTH magic and extension say "image":
             # "GIF89a;<?php ..." saved as .php must still get YARA.
@@ -9959,6 +10029,7 @@ run_scan_loop() {
     [ "$SHA1_BATCH_CNT" -gt 0 ] && _timed_hash_batch "sha1" "$SIG_DIR/sha1.tsv" "${BATCH_SHA1[@]}"
     [ "$MD5_BATCH_CNT" -gt 0 ] && _timed_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
     _flush_image_batch
+    _flush_b64_batch
     [ "$YARA_BATCH_CNT" -gt 0 ] && _timed_yara_batch "${BATCH_YARA[@]}"
     [ "$HEUR_BATCH_CNT" -gt 0 ] && _timed_heur_batch "${BATCH_HEUR[@]}"
     [ "$PE_BATCH_CNT" -gt 0 ] && _timed_pe_batch "${BATCH_PE[@]}"
