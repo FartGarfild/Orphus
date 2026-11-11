@@ -15,6 +15,12 @@
 # Examples (uncomment to use):
 # rule=WEBSHELL_PHP_Dynamic_Big
 # rule=WEBSHELL_PHP_Encoded_Big
+# --- path anchoring (0.3.4+) ---
+# "[|]/usr/share/x/" = the path STARTS with /usr/share/x/ (also under the scan
+# root: -d /mnt/copy or --offline-root /mnt/copy). Use this form for system
+# paths. "[|][^|]*/x/" matches /x/ anywhere - also /home/u/public_html/x/,
+# which a site owner can create - keep it for things that really live
+# anywhere (vendor/, .acme.sh, awstats pages), and always with a rule=.
 pattern=/bin/sh -i.*/sbin/chroot$
 pattern=/bin/sh -i.*nc_openbsd\.1\.gz$
 rule=EXT_WEBSHELL_PHP_Generic.*/vendor/matomo/device-detector/README\.md
@@ -44,41 +50,43 @@ rule=(maldoc_find_kernel32_base_method_1|maldoc_indirect_function_call_3)[|]
 rule=s_PUA_
  
 # --- ClamAV signatures (PE etc.) on files that are not malware ---
-rule=s_[A-Za-z0-9_]*[|][^|]*/boot/vmlinuz
-rule=s_[A-Za-z0-9_]*[|][^|]*/usr/libexec/fwupd/efi/
-rule=s_[A-Za-z0-9_]*[|][^|]*/var/lib/containerd/
+rule=s_[A-Za-z0-9_]*[|]/boot/vmlinuz
+rule=s_[A-Za-z0-9_]*[|]/usr/libexec/fwupd/efi/
+rule=s_[A-Za-z0-9_]*[|]/var/lib/containerd/
 rule=s_Xls_Macro_SYLKAgent_[A-Za-z0-9_]*[|][^|]*[.](js|map|htm)$
-rule=s_(Pdf_Exploit|Html_Spyware)_[A-Za-z0-9_]*[|][^|]*/usr/local/mgr5/
-rule=s_Java_Malware_[A-Za-z0-9_]*[|][^|]*/usr/local/(bin/wp|mgr5/)
+rule=s_(Pdf_Exploit|Html_Spyware)_[A-Za-z0-9_]*[|]/usr/local/mgr5/
+rule=s_Java_Malware_[A-Za-z0-9_]*[|]/usr/local/(bin/wp|mgr5/)
  
 # --- nmap ships exploit/shell strings and a Windows psexec service exe by design ---
-[|][^|]*/usr/share/nmap/(scripts|nselib)/
+[|]/usr/share/nmap/(scripts|nselib)/
  
 # --- single known false positives ---
-rule=LinuxHacktool_eyes_screen[|][^|]*/usr/bin/screen$
+rule=LinuxHacktool_eyes_screen[|]/usr/bin/screen$
 rule=SharedStrings[|][^|]*/libmemcached
-rule=Bolonyokte[|][^|]*/usr/local/mgr5/
+rule=Bolonyokte[|]/usr/local/mgr5/
 rule=overwrite_globals_hack[|][^|]*/engine/classes/min/lib/JSMinify[.]php$
-rule=php_malfunctions[|][^|]*(/ace/mode-|/vim/vim[0-9]+/autoload/phpcomplete)
+rule=php_malfunctions[|][^|]*/ace/mode-
+rule=php_malfunctions[|]/usr/share/vim/vim[0-9]+/autoload/phpcomplete
  
 # --- not executable content: database files and web-server access logs ---
-[|][^|]*/var/lib/mysql[^|]*[.](ibd|MYI|MYD|frm)$
-[|][^|]*/var/www/(httpd-logs|www-root/data/logs)/
+[|]/var/lib/mysql[^|]*[.](ibd|MYI|MYD|frm)$
+[|]/var/www/(httpd-logs|www-root/data/logs)/
 
 rule=s_Xls_Macro_SYLKAgent_[A-Za-z0-9_]*[|][^|]*[.](js|cjs|mjs|map|htm)$
-rule=Bolonyokte[|][^|]*/var/lib/containerd/
+rule=Bolonyokte[|]/var/lib/containerd/
 
-rule=EquationGroup_porkserver[A-Za-z0-9_]*[|][^|]*/usr/sbin/inetd$
-rule=LinuxHacktool_eyes_screen[|][^|]*/usr/bin/screen$
+rule=EquationGroup_porkserver[A-Za-z0-9_]*[|]/usr/sbin/inetd$
 
 rule=Scarhikn(Strings)?[|]
 rule=JavaDeploymentToolkit[|][^|]*/plugindetect\.js$
 rule=multiple_versions[|][^|]*\.pdf$
-rule=(scriptkiddies|Bolonyokte)[|][^|]*(/var/lib/awstats/|/awstats\.[^/|]*\.html$)
-rule=EXPL_[A-Za-z0-9_]*[|][^|]*/var/log/
-rule=s_Java_Malware_CVE_2021_44228_[0-9a-z_]*[|][^|]*(/\.acme\.sh/acme\.sh$|/var/lib/apt/lists/)
+rule=(scriptkiddies|Bolonyokte)[|]/var/lib/awstats/
+rule=(scriptkiddies|Bolonyokte)[|][^|]*/awstats\.[^/|]*\.html$
+rule=EXPL_[A-Za-z0-9_]*[|]/var/log/
+rule=s_Java_Malware_CVE_2021_44228_[0-9a-z_]*[|][^|]*/\.acme\.sh/acme\.sh$
+rule=s_Java_Malware_CVE_2021_44228_[0-9a-z_]*[|]/var/lib/apt/lists/
 rule=with_attachment[|][^|]*/Maildir/
-pattern=/bin/sh -i[|][^|]*/usr/share/locale/[^/]+/LC_MESSAGES/coreutils\.mo$
-rule=(suspicious_version|invalid_xref_numbers|header_evasion)[|][^|]*/usr/share/rspamd/lualib/lua_magic/patterns\.lua$
+pattern=/bin/sh -i[|]/usr/share/locale/[^/]+/LC_MESSAGES/coreutils\.mo$
+rule=(suspicious_version|invalid_xref_numbers|header_evasion)[|]/usr/share/rspamd/lualib/lua_magic/patterns\.lua$
 # ClamAV hash of the stock Apache default page (also copied to /var/www/html/index.html)
 name=Win\.Malware\.Agent-7761848-0[|]

@@ -605,7 +605,7 @@ VERSION="0.3.4"
 # Format of the compiled signature cache (signatures/.cache). Raise it whenever
 # compile_signatures produces different output for the same sources: the cache
 # is rebuilt on the next run. Independent of VERSION, which is just a label.
-CACHE_FORMAT=6
+CACHE_FORMAT=7
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Re-exec into our OWN bundled bash (see build_bash_from_source /
@@ -942,7 +942,7 @@ detect_platform() {
         x86_64|amd64)   ARCH="x86_64" ;;
         aarch64|arm64)  ARCH="arm64" ;;
         armv7*)         ARCH="armv7" ;;
-        *)              ARCH="x86_64" ;;
+        *)              : ;;      # keep the real name: no x86_64 busybox for it
     esac
 }
 
@@ -1062,6 +1062,41 @@ net_fetch() {
         if _fetch_size_ok "$dest"; then return 0; else rm -f "$dest" 2>/dev/null; fi
     fi
     rm -f "$dest" 2>/dev/null
+    return 1
+}
+
+# Pinned SHA-256 of what --setup downloads and then runs or builds as root.
+# A pin that is set is enforced (mismatch = the download is deleted, the
+# step fails). An empty pin only prints the hash, so it can be compared
+# with the vendor's and written here (or exported as ORPHUS_PIN_<NAME>).
+# Pins belong to the default versions/URLs only: another version
+# (SETUP_*_VERSION) or URL (--busybox-url, --yara-url) is not checked
+# against them.
+PIN_BUSYBOX_X86_64="${ORPHUS_PIN_BUSYBOX_X86_64:-}"     # busybox 1.35.0 x86_64 musl (busybox.net)
+PIN_YARA_SRC="${ORPHUS_PIN_YARA_SRC:-}"                 # yara v4.5.8 source tarball (GitHub tag archive)
+PIN_GREP_SRC="${ORPHUS_PIN_GREP_SRC:-}"                 # grep-3.11.tar.gz
+PIN_BASH_SRC="${ORPHUS_PIN_BASH_SRC:-}"                 # bash-5.2.21.tar.gz
+_sha256_of() {
+    if command -v sha256sum &>/dev/null; then sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+    elif command -v shasum &>/dev/null; then shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+    elif command -v openssl &>/dev/null; then openssl dgst -sha256 "$1" 2>/dev/null | sed 's/.* //'
+    fi
+}
+_pin_check() {   # file, what, pin -> 0 ok / not pinned, 1 mismatch
+    local f="$1" what="$2" pin="$3" h
+    h=$(_sha256_of "$f")
+    if [ -z "$h" ]; then
+        echo -e "${Y}[WARN] cannot compute sha256 of ${what} (no sha256sum/shasum/openssl) -> not verified${Z}"
+        [ -z "$pin" ]; return
+    fi
+    if [ -z "$pin" ]; then
+        echo "     sha256 ${what}: ${h}  (no pinned checksum for it yet - compare with the vendor's)"
+        return 0
+    fi
+    if [ "$h" = "$pin" ]; then
+        echo -e "${G}[OK] ${what}: sha256 matches the pinned checksum${Z}"; return 0
+    fi
+    echo -e "${R}[FAIL] ${what}: sha256 ${h} does NOT match the pinned ${pin} -> refusing to use it (tampered download or a mirror serving something else)${Z}"
     return 1
 }
 
@@ -1185,6 +1220,14 @@ download_busybox() {
     echo -e "${C}[*] BusyBox not found locally -> auto-downloading (~1MB)...${Z}"
     rm -f "$tmp" 2>/dev/null
     net_fetch "$url" "$tmp" 15 "" 10 >/dev/null 2>&1
+    # checksum BEFORE the file is made executable and run ("--help" in the
+    # verifier executes it)
+    local _bpin=""
+    [ -z "$BUSYBOX_URL_ARG" ] && [ "${OS}_${ARCH}" = "linux_x86_64" ] && _bpin="$PIN_BUSYBOX_X86_64"
+    if [ -s "$tmp" ] && ! _pin_check "$tmp" "busybox" "$_bpin"; then
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
     chmod +x "$tmp" 2>/dev/null
     if verify_busybox_binary "$tmp"; then
         mv -f "$tmp" "$dest" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; echo -e "${R}[FAIL] cannot place busybox at $dest${Z}"; return 1; }
@@ -1637,6 +1680,7 @@ build_yara_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    _pin_check "$workdir/yara.tar.gz" "yara source" "$([ -z "${SETUP_YARA_VERSION:-}" ] && echo "$PIN_YARA_SRC")" || { rm -rf "$workdir"; return 1; }
     tar -xzf "$workdir/yara.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
 
     (
@@ -1725,6 +1769,7 @@ build_grep_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    _pin_check "$workdir/grep.tar.gz" "grep source" "$([ -z "${SETUP_GREP_VERSION:-}" ] && echo "$PIN_GREP_SRC")" || { rm -rf "$workdir"; return 1; }
     tar -xzf "$workdir/grep.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
 
     (
@@ -1814,6 +1859,7 @@ build_bash_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    _pin_check "$workdir/bash.tar.gz" "bash source" "$([ -z "${SETUP_BASH_VERSION:-}" ] && echo "$PIN_BASH_SRC")" || { rm -rf "$workdir"; return 1; }
     tar -xzf "$workdir/bash.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
 
     (
@@ -1884,6 +1930,14 @@ run_self_setup() {
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -r|--max-ram|-j|--workers|-d|--dir|-s|--sigs|-m|--max-size|-o|--output|--ignore-sigs|-X|--exclude|\
+            --archive-max-mb|--archive-ram-max-mb|--archive-max-extract-mb|--archive-max-depth|--archive-max-files|\
+            --yara-timeout|--yara-rules|--sandbox-mode|--offline-root|--audit-since|--long-time-threshold|\
+            -b|--busybox|--busybox-url|--yara-url|--mb-key|--quarantine-dir|--quarantine-perm|--incremental-cache|\
+            --watch-interval|--max-hex-patterns|--batch-size|--heur-batch-size|--pe-batch-size)
+                [ $# -ge 2 ] || { echo "[FAIL] $1 needs a value" >&2; exit 1; } ;;
+        esac
         case "$1" in
             -u|--update)     DO_UPDATE=true; shift ;;
             -r|--max-ram)    MAX_RAM_MB="$2"; shift 2 ;;
@@ -2432,12 +2486,38 @@ update_ignore_sigs_upstream() {
     # canary detections in ordinary site / system locations: no shared line
     # may hide these
     local canary
-    canary=$'YARA_MATCH|rule=Orphus_Canary_Rule|/home/user/public_html/index.php\nKNOWN_MALWARE|name=Orphus.Canary-1|md5=0|/var/www/html/wp-config.php\nSIG_STRING_MATCH|pattern=eval(base64_decode(|/home/site/www/upload/shell.php\nHEURISTIC|reason=canary|/tmp/x.php'
-    canary=$(printf '%b' "$canary")
+    # Real detections a shared line must never hide: findings of the main
+    # webshell / malware rule families and of the built-in checks, in
+    # ordinary site and temp paths. A line that matches any of them is
+    # dropped - "rule=WEBSHELL_[A-Za-z0-9_]*[|]" pushed to the repository
+    # (by mistake or by whoever took the account over) must not switch
+    # webshell detection off on every server at the next -u.
+    canary=$(
+        for _cp in /home/user/public_html/index.php /var/www/html/wp-content/uploads/x.php /var/www/clients/client1/web1/web/modules/m/a.php /home/site/www/upload/shell.php /tmp/x.php /var/tmp/.x /dev/shm/.y; do
+            for _cr in Orphus_Canary_Rule WEBSHELL_PHP_Generic_Eval WEBSHELL_PHP_By_String_Known_Webshell EXT_WEBSHELL_PHP_Generic APT_WebShell_Tiny_1 \
+                       WEBSHELL_PHP_OBFUSC_Encoded WEBSHELL_ASP_Generic WEBSHELL_JSP_Generic webshell_php_generic php_malfunctions \
+                       Orphus_PHP_Webshell_Eval_Request_Tiny Orphus_Linux_Miner_Watchdog_KHP s_Php_Webshell_Agent_1_n0a1b2c3d s__HEX_php_cmdshell_unclassed_1_n0a1b2c3d \
+                       HKTL_Linux_Generic MAL_ELF_Miner_XMRig Linux_Trojan_Mirai SUSP_Base64_Encoded_PHP; do
+                printf 'YARA_MATCH|rule=%s|%s\n' "$_cr" "$_cp"
+            done
+            printf 'KNOWN_MALWARE|name=Orphus.Canary-1|md5=0|%s\n' "$_cp"
+            printf 'KNOWN_MALWARE|name=Php.Webshell.Agent-1|sha256=0|%s\n' "$_cp"
+            printf 'KNOWN_MALWARE|name={HEX}php.cmdshell.unclassed.1|md5=0|%s\n' "$_cp"
+            printf 'SIG_STRING_MATCH|pattern=eval(base64_decode(|%s\n' "$_cp"
+            printf 'SIG_STRING_MATCH|pattern=/bin/sh -i|%s\n' "$_cp"
+            printf 'HEX_SIG_MATCH|hex=3c3f706870...|%s\n' "$_cp"
+            printf 'SUSPICIOUS_B64_PAYLOAD|decoded=ELF|yara=x|b64=f0VMRg...|%s\n' "$_cp"
+            printf 'DISGUISED_FILE|ext=.jpg|real=SCRIPT|%s\n' "$_cp"
+            printf 'KNOWN_MALWARE_PATH|ioc=.X11R6|miner/botnet file name|%s\n' "$_cp"
+            printf 'SUSPICIOUS_TMP_EXEC|type=ELF|hidden=yes|perms=0755|%s\n' "$_cp"
+            printf 'YARA_MATCH|archive_member=a.php|rule=WEBSHELL_PHP_Generic_Eval|%s\n' "$_cp"
+        done
+    )
     {
         while IFS= read -r p || [ -n "$p" ]; do
             p="${p%$'\r'}"
             case "$p" in ''|'#'*|[[:space:]]*'#'*) printf '%s\n' "$p"; continue ;; esac
+            [ -z "${p//[[:space:]]/}" ] && { printf '\n'; continue; }      # whitespace only
             # (busybox grep compiles the regex only once it reads a line)
             printf 'x\n' | bb grep -E -- "$p" >/dev/null 2>&1
             if [ $? -eq 2 ]; then badre=$((badre+1)); printf '# [dropped: invalid ERE] %s\n' "$p"; continue; fi
@@ -2552,6 +2632,20 @@ EOF
 # deletes on interrupt) — workers append to it AS threats are found, so an
 # interrupted scan still leaves usable results behind instead of losing
 # everything found up to that point.
+# 0 = only the current user (or root) can create/replace files in this dir.
+# A sticky world-writable dir (/tmp) counts as private enough: others cannot
+# replace files we created there, and pre-planted names are removed/refused.
+_report_dir_private() {
+    local d="$1" o m
+    [ -d "$d" ] || return 0
+    o=$(stat -c %u "$d" 2>/dev/null) || return 0
+    m=$(stat -c %a "$d" 2>/dev/null) || return 0
+    [ "$o" = "$(id -u)" ] || [ "$o" = 0 ] || return 1
+    m="0000$m"; m="${m: -4}"
+    (( 8#$m & 8#0022 )) || return 0          # not group/other writable
+    (( 8#$m & 8#1000 )) && return 0          # sticky
+    return 1
+}
 init_live_report() {
     local f
     if [ -n "$OUTPUT_FILE" ]; then
@@ -2559,7 +2653,7 @@ init_live_report() {
         # truncate/append to its target: refuse. An existing regular file is
         # unlinked and created anew (noclobber below), never written into —
         # so a hard link to another file is not modified either.
-        for f in "$OUTPUT_FILE" "${OUTPUT_FILE}-SUID" "${OUTPUT_FILE}.slow"; do
+        for f in "$OUTPUT_FILE" "${OUTPUT_FILE}-SUID" "${OUTPUT_FILE}-PERMS" "${OUTPUT_FILE}.slow" "${OUTPUT_FILE}.skipped"; do
             if [ -L "$f" ]; then
                 echo -e "${R}[FAIL] -o: refusing to write through a symlink: $f${Z}" >&2
                 exit 1
@@ -2570,8 +2664,14 @@ init_live_report() {
             rm -f -- "$OUTPUT_FILE" 2>/dev/null
         fi
         LIVE_REPORT_FILE="$OUTPUT_FILE"
+        _report_dir_private "$(dirname "$OUTPUT_FILE")" || echo -e "${Y}[WARN] -o: $(dirname "$OUTPUT_FILE") can be written by other users - they could swap the report files for symlinks while the scan runs. Prefer a directory only you can write to.${Z}"
     else
-        LIVE_REPORT_FILE="$(pwd)/av_scan_threats_$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "$$").log"
+        local _rd; _rd="$(pwd)"
+        if ! _report_dir_private "$_rd"; then
+            echo -e "${Y}[*] The current directory can be written by other users -> the report goes to ${SCRIPT_DIR} instead (-o FILE to choose)${Z}"
+            _rd="$SCRIPT_DIR"
+        fi
+        LIVE_REPORT_FILE="${_rd}/av_scan_threats_$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "$$").log"
         # Name already taken (or planted): never open it, take a fresh name.
         if [ -e "$LIVE_REPORT_FILE" ] || [ -L "$LIVE_REPORT_FILE" ]; then
             LIVE_REPORT_FILE="${LIVE_REPORT_FILE%.log}_$$.log"
@@ -2584,6 +2684,9 @@ init_live_report() {
     # needs to look at. Same base name, "-SUID" appended, next to the
     # main report.
     SUID_REPORT_FILE="${LIVE_REPORT_FILE}-SUID"
+    # stale companions of an earlier run with the same name, and anything
+    # planted under these names (a symlink is removed, never followed)
+    rm -f -- "${LIVE_REPORT_FILE}-SUID" "${LIVE_REPORT_FILE}-PERMS" "${LIVE_REPORT_FILE}.skipped" 2>/dev/null
     # Same idea for bad file permissions (0777 and friends on a whole site
     # tree gives hundreds of lines): own file, own counter, not "threats".
     PERMS_REPORT_FILE="${LIVE_REPORT_FILE}-PERMS"
@@ -2982,7 +3085,7 @@ _yara_category() {
         */signature-base/yara/*|*/signature-base/vendor/*|*/signature-base/tests/*|*/yara/rules/*) ;;
         *) echo "-"; return ;;
     esac
-    case "$b" in index.yar|*_index.yar) echo index; return ;; esac
+    case "$b" in index.yar|*_index.yar|index_*.yar) echo index; return ;; esac
     case "$p" in
         */signature-base/tests/*|*/signature-base/vendor/*|*/yara/rules/antidebug_antivm/*|*/yara/rules/capabilities/*|\
         */yara/rules/crypto/*|*/yara/rules/packers/*|*/yara/rules/utils/*|*/yara/rules/deprecated/*|*/yara/rules/mobile_malware/*)
@@ -3167,7 +3270,8 @@ _yara_name_excluded() {
 _yara_file_excluded() {
     local f="$1" list="$2" cat inc
     [ -z "$YARA_CATS" ] && _yara_expand_profile
-    case "${f##*/}" in index.yar|*_index.yar) return 0 ;; esac
+    # index files only "include" the others (index_w_mobile.yar: 480 lines)
+    case "${f##*/}" in index.yar|*_index.yar|index_*.yar) return 0 ;; esac
     cat=$(_yara_category "$f")
     if [ "$cat" != "-" ]; then
         case " $YARA_CATS " in *" $cat "*) ;; *) return 0 ;; esac
@@ -3338,8 +3442,14 @@ _yara_fix_dup_names() {
     local f="$1" err
     err=$("$YARAC_BIN" "${yara_extvars[@]}" "$f" /dev/null 2>&1 >/dev/null | grep '^error')
     [ -n "$err" ] || return 1
-    printf '%s\n' "$err" | grep -vq ': duplicated identifier "' && return 1
-    printf '%s\n' "$err" | bb sed -nE 's/.*\(([0-9]+)\): duplicated identifier "([A-Za-z0-9_]+)".*/\1 \2/p' > "$f.dups"
+    # (here-strings, not "printf | grep -q": under pipefail a big error text
+    # makes printf die of SIGPIPE when grep -q stops reading, and the guard
+    # silently did not fire)
+    grep -vq ': duplicated identifier "' <<< "$err" && return 1
+    bb sed -nE 's/.*\(([0-9]+)\): duplicated identifier "([A-Za-z0-9_]+)".*/\1 \2/p' <<< "$err" > "$f.dups"
+    # with an empty first file awk's NR == FNR is true for the rule file
+    # itself: it would be written out EMPTY and then "compile"
+    [ -s "$f.dups" ] || { rm -f "$f.dups"; return 1; }
     bb awk 'NR == FNR { d[$1] = $2; next }
         (FNR in d) {
             id = d[FNR]; s = $0; o = ""
@@ -3606,6 +3716,8 @@ EOF
             -not -path '*/custom/*' \
             -not -path '*/.cache/*' \
             -not -path '*/kernel_refs/*' \
+            -not -name ".*" -not -name "ignore_sigs*" -not -name "*.upstream" -not -name "yara_exclude" \
+            -not -name "generic_obfuscation_rules" -not -name "known_vendor_obfuscation" -not -name "*.log" -not -name "*.log-*" \
             -not -name "*.pack" -not -name "*.idx" -not -name "*.cvd" \
             -not -name "*.yarc" -not -name "*.compiled" \
             -not -name "*.yar" -not -name "*.yara" \
@@ -3814,13 +3926,21 @@ EOF
         # "s_Win_Test_LilEXE_..." instead of a temp-file path) plus kind
         # (n=ndb, l=ldb), the parallel chunk id and the line number, which keep
         # it unique even when ClamAV reuses a family name on many lines.
-        function rule_id(name, kind,    r, t) {
+        # s_<name>_<n|l><8 hex of the signature text>: the same signature gets
+        # the same rule name on every build (the old chunk/line-number suffix
+        # changed with every -u, so an ignore_sigs line naming the rule died).
+        function rule_id(name, kind,    r, i, c, a, b, s) {
             r = name
             gsub(/[^a-zA-Z0-9_]/, "_", r)
             if (length(r) > 100) r = substr(r, 1, 100)
-            t = FILENAME
-            if (sub(/.*chunk_/, "", t) == 0) t = "x"
-            return "s_" r "_" kind t "_" NR
+            if (!_ordset) { for (i = 1; i < 256; i++) _ORD[sprintf("%c", i)] = i; _ordset = 1 }
+            s = $0; a = 5381; b = 0
+            for (i = 1; i <= length(s); i++) {
+                c = _ORD[substr(s, i, 1)] + 0
+                a = (a * 33 + c) % 2147483647
+                b = (b * 65599 + c) % 2147483629
+            }
+            return "s_" r "_" kind sprintf("%08x", (a + b) % 4294967296)
         }
     '
 
@@ -4115,6 +4235,7 @@ EOF
             $1 == "B64"      { print $2 "\t" $3 >> (out "/b64_payloads.tsv") }
             $1 == "HEX"      { print $2 >> (out "/hex_ere.txt") }
             $1 ~ /^YARARULE_/ {
+                if (seenrule[$0]++) next          # the same signature in two database files
                 g = substr($1, 10)
                 if (index(groups, " " g " ")) { print $2 >> (out "/yara/generated_ndb_ldb." g ".yar"); gn[g]++ } else gs[g]++
             }
@@ -4671,7 +4792,8 @@ init_workdir() {
     _dir_lock_hold "$SIG_DIR" 6
     # every exit path (also the "exit 1" ones after this point) drops this
     # run's hard-link dir; the work dir has its own cleanup paths
-    trap 'case "$SIG_DIR" in */.cache/run.*) rm -rf "$SIG_DIR" 2>/dev/null ;; esac' EXIT
+    trap 'case "$SIG_DIR" in */.cache/run.*) rm -rf "$SIG_DIR" 2>/dev/null ;; esac
+          case "$WORK_DIR" in */av_scan_*) rm -rf "$WORK_DIR" 2>/dev/null ;; esac' EXIT
 }
 
 extract_worker() {
@@ -4767,6 +4889,16 @@ IOC_PROC_CMD_RE='(khp-wdg|/\.X11R6|/\.xwd|/\.khp|/\.cache-jd/|universal-miner|xm
 # the system binary directories
 IOC_PROC_DISGUISE_RE='^(rsyslogd|syslog-ng|chronyd|supervisord|supervisor|httpx|unicorn|apt-update|bluetooth-notify|q-start|keeper|rosetta|zzh)$'
 
+# Print one finding whose text holds data we do not control (a process
+# command line, a file name from the inspected disk, a log line): control
+# bytes become "?" and nothing is interpreted as an escape, so a process
+# cannot erase its own line from the terminal ("\r ESC[2K") and a log entry
+# cannot repaint the audit.
+_say() {
+    local t="$2"
+    printf '%b%s%b\n' "$1" "${t//[$'\001'-$'\037'$'\177']/?}" "${Z}"
+}
+
 scan_processes() {
     echo -e "${B}[*] Scanning running processes for rootkit indicators...${Z}"
     [ -d /proc ] || { echo -e "${Y}[WARN] /proc not available -> skipping process scan${Z}"; return; }
@@ -4791,7 +4923,7 @@ scan_processes() {
         case "$exe_link" in
             *" (deleted)")
                 local real_path="${exe_link% (deleted)}"
-                echo -e "${R}[!] [PROCESS_DELETED_BINARY] PID=${pid} exe=${real_path} cmdline=${cmdline}${Z}"
+                _say "$R" "[!] [PROCESS_DELETED_BINARY] PID=${pid} exe=${real_path} cmdline=${cmdline}"
                 found=$(( found + 1 ))
                 ;;
             *)
@@ -4800,7 +4932,7 @@ scan_processes() {
                     h=$($SHA256_CMD "$pid_dir/exe" 2>/dev/null | grep -oE '[0-9a-f]{64}' | head -1)
                     if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/sha256.tsv" 2>/dev/null; then
                         local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/sha256.tsv" | cut -f2)
-                        echo -e "${R}[!] [PROCESS_KNOWN_MALWARE] PID=${pid} exe=${exe_link} name=${n:-Malware} cmdline=${cmdline}${Z}"
+                        _say "$R" "[!] [PROCESS_KNOWN_MALWARE] PID=${pid} exe=${exe_link} name=${n:-Malware} cmdline=${cmdline}"
                         found=$(( found + 1 ))
                     fi
                 fi
@@ -4816,7 +4948,7 @@ scan_processes() {
             local preload
             preload=$(tr '\0' '\n' < "$pid_dir/environ" 2>/dev/null | bb grep "^LD_PRELOAD=" | head -1)
             if [ -n "$preload" ]; then
-                echo -e "${Y}[!] [PROCESS_LD_PRELOAD] PID=${pid} ${preload} cmdline=${cmdline}${Z}"
+                _say "$Y" "[!] [PROCESS_LD_PRELOAD] PID=${pid} ${preload} cmdline=${cmdline}"
                 found=$(( found + 1 ))
             fi
         fi
@@ -4839,7 +4971,7 @@ scan_processes() {
         [ -z "$_why" ] && case "$cmdline" in "["*"]"*) _why="userspace process disguised as a kernel thread" ;; esac
         [ -z "$_why" ] && case "$_ex" in /tmp/*|/var/tmp/*|/dev/shm/*) _why="running from a temp dir" ;; esac
         if [ -n "$_why" ]; then
-            echo -e "${R}[!] [PROCESS_SUSPICIOUS] PID=${pid} user=$(bb stat -c %U "$pid_dir" 2>/dev/null) exe=${exe_link} (${_why}) cmdline=${cmdline}${Z}"
+            _say "$R" "[!] [PROCESS_SUSPICIOUS] PID=${pid} user=$(bb stat -c %U "$pid_dir" 2>/dev/null) exe=${exe_link} (${_why}) cmdline=${cmdline}"
             found=$(( found + 1 ))
         fi
     done
@@ -4864,7 +4996,7 @@ scan_processes() {
                 [ -d "/proc/$p" ] || continue   # already exited -> just churn
                 if ! echo "$still_there" | grep -qx "$p"; then
                     local pcmd; pcmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | head -c 150)
-                    echo -e "${R}[!] [PROCESS_HIDDEN_FROM_PS] PID=${p} visible in /proc but not ps, twice -- cmdline=${pcmd}${Z}"
+                    _say "$R" "[!] [PROCESS_HIDDEN_FROM_PS] PID=${p} visible in /proc but not ps, twice -- cmdline=${pcmd}"
                     found=$(( found + 1 ))
                 fi
             done
@@ -4955,11 +5087,11 @@ scan_kernel_refs() {
         verdict="${res%%$'\t'*}"; a="${res#*$'\t'}"
         case "$verdict" in
             OK)       echo -e "${G}[OK] ${f} = ${a} (matches the distribution's package)${Z}" ;;
-            MISMATCH) echo -e "${R}[!] [KERNEL_REF_MISMATCH] ${f} — '${name}' is a known kernel, but this file's md5 (${md5}) matches NONE of its known builds${Z}"
+            MISMATCH) _say "$R" "[!] [KERNEL_REF_MISMATCH] ${f} — '${name}' is a known kernel, but this file's md5 (${md5}) matches NONE of its known builds"
                       KREF_FINDINGS=$((KREF_FINDINGS + 1)) ;;
-            RENAMED)  echo -e "${Y}[!] [KERNEL_REF_RENAMED] ${f} — content equals ${a}, but the file has a different name${Z}"
+            RENAMED)  _say "$Y" "[!] [KERNEL_REF_RENAMED] ${f} — content equals ${a}, but the file has a different name"
                       KREF_FINDINGS=$((KREF_FINDINGS + 1)) ;;
-            *)        echo -e "${Y}[?] [KERNEL_REF_UNKNOWN] ${f} (md5 ${md5}) — not in the list: custom kernel, another distribution, or newer/older than the list${Z}" ;;
+            *)        _say "$Y" "[?] [KERNEL_REF_UNKNOWN] ${f} (md5 ${md5}) — not in the list: custom kernel, another distribution, or newer/older than the list" ;;
         esac
     done
     [ "$seen" -eq 0 ] && echo -e "${Y}[INFO] No boot/vmlinuz-* regular files found under ${root:-/}boot${Z}"
@@ -5036,7 +5168,7 @@ scan_kernel_integrity() {
             fi
         fi
         if [ -z "$pkg" ]; then
-            echo -e "${Y}[!] [KERNEL_FILE_UNOWNED] ${f} — not tracked by any installed package${Z}"
+            _say "$Y" "[!] [KERNEL_FILE_UNOWNED] ${f} — not tracked by any installed package"
             found=$(( found + 1 ))
             continue
         fi
@@ -5047,7 +5179,7 @@ scan_kernel_integrity() {
         [ -z "$expected" ] && continue
         actual=$(md5sum "$f" 2>/dev/null | cut -d' ' -f1)
         if [ "$expected" != "$actual" ]; then
-            echo -e "${R}[!] [KERNEL_FILE_TAMPERED] ${f} (package: ${pkg}) — checksum does NOT match package record${Z}"
+            _say "$R" "[!] [KERNEL_FILE_TAMPERED] ${f} (package: ${pkg}) — checksum does NOT match package record"
             found=$(( found + 1 ))
         fi
     done
@@ -5177,9 +5309,9 @@ AUD_PAT_WEAK="${AUD_PAT_STRONG}|/(tmp|var/tmp|dev/shm)/[^ ]+"
 _aud() {   # severity tag text...
     local sev="$1" tag="$2"; shift 2
     case "$sev" in
-        HIGH) echo -e "${R}[!] [AUDIT_${tag}] $*${Z}"; echo H >> "$AUD_CNT" ;;
-        MED)  echo -e "${Y}[?] [AUDIT_${tag}] $*${Z}"; echo M >> "$AUD_CNT" ;;
-        *)    echo -e "    [AUDIT_${tag}] $*";          echo I >> "$AUD_CNT" ;;
+        HIGH) _say "$R" "[!] [AUDIT_${tag}] $*"; echo H >> "$AUD_CNT" ;;
+        MED)  _say "$Y" "[?] [AUDIT_${tag}] $*"; echo M >> "$AUD_CNT" ;;
+        *)    _say "" "    [AUDIT_${tag}] $*";   echo I >> "$AUD_CNT" ;;
     esac
 }
 
@@ -5767,7 +5899,7 @@ update_incremental_cache() {
                 p = p "|"; r = substr(r, j + 1)
             }
             print p r
-        }' > "$threat_paths" 2>/dev/null
+        }' | tr '\034' '|' > "$threat_paths" 2>/dev/null
     [ -f "$threat_paths" ] || : > "$threat_paths"
 
     # A worker that died (OOM, kill, crash) never wrote its pool_N.done
@@ -5852,7 +5984,7 @@ collect_files() {
     # Report files and their -SUID/.slow siblings (they quote matched
     # strings, so a report inside the scanned tree would "detect" itself).
     for p in "$LIVE_REPORT_FILE" "$OUTPUT_FILE"; do
-        [ -n "$p" ] && self_paths+=("$p" "$p-SUID" "$p.slow")
+        [ -n "$p" ] && self_paths+=("$p" "$p-SUID" "$p-PERMS" "$p.slow" "$p.skipped")
     done
 
     # User-specified extra exclusions (-X/--exclude, repeatable)
@@ -6471,7 +6603,7 @@ _print_perms_summary() {
     [ "${TPERM:-0}" -gt 0 ] || return 0
     echo -e "\n ${Y}[i]${Z} ${TPERM} file(s) with unsafe permissions (world-writable + executable) — not counted as threats${PERMS_REPORT_FILE:+, full list: ${C}${PERMS_REPORT_FILE}${Z}}"
     bb grep -h "^THREAT:WORLD_WRITABLE_EXEC|" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d'|' -f2 \
-        | bb sed 's|/[^/]*$||' | bb sort | bb uniq -c | bb sort -rn | head -10 | tr '\001-\011\013-\037\177' '?' \
+        | bb sed 's|/[^/]*$||' | bb sort | bb uniq -c | bb sort -rn | head -10 | tr '\001-\011\013-\033\035-\037\177' '?' | tr '\034' '|' \
         | while read -r n d; do printf '     %6s  %s/\n' "$n" "$d"; done
     echo -e "     fix example: find DIR -type f -perm -0002 -exec chmod o-w {} +   (and chmod a-x for non-scripts)"
 }
@@ -6483,19 +6615,15 @@ print_report() {
         echo -e "\n${R}${B}=== DETECTED THREATS ===${Z}"
         bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
             | bb grep -v "^THREAT:WORLD_WRITABLE_EXEC|" | bb awk '!(/^THREAT:SUID_SGID[|]/ && !/TAMPERED/)' \
-            | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?' \
+            | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\033\035-\037\177' '?' \
             | while IFS= read -r line; do
-                # "TYPE|path|info": the path may itself contain "|", so the
-                # info starts at the first "|key=" (rule=, name=, perms= ...),
-                # not at the second "|".
+                # "TYPE|path|info": a "|" inside the path is stored as \034 by threat(),
+                # so the second "|" really ends the path (restored for display).
                 type="${line%%|*}"; rest="${line#*|}"
-                if [[ "$rest" =~ \|[a-z_]+= ]]; then
-                    file="${rest%%"${BASH_REMATCH[0]}"*}"; info="${rest#"$file|"}"
-                else
-                    file="${rest%|*}"; info="${rest##*|}"
-                fi
+                case "$rest" in *"|"*) file="${rest%%|*}"; info="${rest#*|}" ;; *) file="$rest"; info="" ;; esac
                 # printf %s, not echo -e: a name containing a literal "\n"
                 # (or "\r", "\033[...") must not become a forged line.
+                file="${file//$'\034'/|}"
                 printf ' %b[!]%b [%b%s%b] %s %b%s%b\n' "$R" "$Z" "$Y" "$type" "$Z" "$file" "$C" "${info:-}" "$Z"
               done
     else
@@ -6529,7 +6657,7 @@ save_report() {
             # suppresses that filename prefix.
             bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null \
                 | bb grep -v "^THREAT:WORLD_WRITABLE_EXEC|" | bb awk '!(/^THREAT:SUID_SGID[|]/ && !/TAMPERED/)' \
-                | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?'
+                | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\033\035-\037\177' '?' | tr '\034' '|'
         }
     } >&3; exit 0 ) || { echo -e "${Y}[WARN] Can't create ${LIVE_REPORT_FILE} -> report not saved${Z}"; return 0; }
     echo -e "\n[*] Report saved: ${C}${LIVE_REPORT_FILE}${Z}"
@@ -6544,7 +6672,7 @@ save_report() {
             echo "# Orphus AV Scanner — SUID/SGID findings (split out from the main report)"
             echo "# Target: $ROOT_DIR"
             echo ""
-            bb grep -h "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?'
+            bb grep -h "^THREAT:SUID_SGID|" "$WORK_DIR/reports"/pool_*.txt "$WORK_DIR/reports"/anomaly_findings.txt 2>/dev/null | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\033\035-\037\177' '?' | tr '\034' '|'
         } >&3 ) 2>/dev/null
         echo -e "[*] SUID/SGID report saved: ${C}${SUID_REPORT_FILE}${Z}"
     fi
@@ -6555,7 +6683,7 @@ save_report() {
             echo "# Orphus AV Scanner — files with unsafe permissions (world-writable + executable)"
             echo "# Not counted as threats. Target: $ROOT_DIR"
             echo ""
-            bb grep -h "^THREAT:WORLD_WRITABLE_EXEC|" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\037\177' '?'
+            bb grep -h "^THREAT:WORLD_WRITABLE_EXEC|" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d: -f2- | bb sort -u | tr '\001-\011\013-\033\035-\037\177' '?' | tr '\034' '|'
         } >&3 ) 2>/dev/null
         echo -e "[*] Permissions report saved: ${C}${PERMS_REPORT_FILE}${Z}"
     fi
@@ -6657,7 +6785,7 @@ feed_realtime_path() {
             # separator in the worker's "size<TAB>mode<TAB>path" protocol.
             f=$(printf '%s' "$path" | tr '\n\t' '??')
             printf 'THREAT:SUSPICIOUS_FILENAME|%s|contains embedded newline/tab byte in the filename itself -- not scanned via the normal pipeline, which splits on these; investigate directly\n' "$f" >> "$REALTIME_REPORT"
-            [ -n "$LIVE_REPORT_FILE" ] && printf '[%s] [SUSPICIOUS_FILENAME] %s contains embedded newline/tab byte in the filename itself\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$f" >> "$LIVE_REPORT_FILE" 2>/dev/null
+            [ -n "$LIVE_REPORT_FILE" ] && [ ! -L "$LIVE_REPORT_FILE" ] && printf '[%s] [SUSPICIOUS_FILENAME] %s contains embedded newline/tab byte in the filename itself\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$f" >> "$LIVE_REPORT_FILE" 2>/dev/null
             return 0 ;;
     esac
     printf '%s\n' "$path" >&3 2>/dev/null || true
@@ -6711,7 +6839,8 @@ tail_realtime_report() {
     tail -n0 -F "$REALTIME_REPORT" 2>/dev/null > >(while IFS= read -r line; do
         case "$line" in
             THREAT:*)
-                echo -e "${R}${B}[RT-THREAT]${Z} ${line#THREAT:}"
+                line="${line#THREAT:}"; line="${line//$'\034'/|}"
+                printf '%b[RT-THREAT]%b %s\n' "${R}${B}" "$Z" "${line//[$'\001'-$'\037'$'\177']/?}"
                 ;;
         esac
     done) &
@@ -6928,6 +7057,7 @@ main() {
     case " $CLAM_GROUPS " in *" pua "*) export AV_CLAM_PUA=true ;; *) export AV_CLAM_PUA=false ;; esac
     export AV_MEDIA_FAST="$MEDIA_FAST"
     export AV_IOC_PATH_ANY_RE="$IOC_PATH_ANY_RE" AV_IOC_PATH_TMP_RE="$IOC_PATH_TMP_RE"
+    export AV_SCAN_ROOT="${OFFLINE_ROOT:-$ROOT_DIR}"
     if [ -n "$(_ignore_sigs_upstream_url)" ] && [ -s "${SIGNATURES}/ignore_sigs.upstream" ]; then
         export AV_IGNORE_UPSTREAM="${SIGNATURES}/ignore_sigs.upstream"
     else
@@ -6993,6 +7123,7 @@ main() {
     [ "$REALTIME_MODE" = true ] && realtime_baseline
     collect_files
     split_pools
+    trap cleanup INT TERM HUP      # before the workers exist: Ctrl+C must not orphan them
     launch_workers
 
     start_monitor
@@ -7642,9 +7773,8 @@ _log_if_long() {
     [ "$LONG_TIME_MODE" = "true" ] || return
     [ $(( elapsed_ms / 1000 )) -ge "$LONG_TIME_THRESHOLD_SEC" ] || return
     [ -n "$LIVE_REPORT_FILE" ] || return
-    printf '[%s] [SLOW_BATCH] type=%s elapsed_ms=%d files=%s\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$kind" "$elapsed_ms" "$*" \
-        >> "${LIVE_REPORT_FILE}.slow" 2>/dev/null
+    _safe_append "${LIVE_REPORT_FILE}.slow" "$(printf '[%s] [SLOW_BATCH] type=%s elapsed_ms=%d files=%s' \
+        "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$kind" "$elapsed_ms" "$*")"
 }
 _timed_hash_batch() {
     local _t0; _t0=$(_now_ms)
@@ -8026,8 +8156,27 @@ _sandbox_run_unshare() {
     # NOTE: unlike bwrap/chroot, this does NOT pivot/chroot the root
     # filesystem — it only gets its own independent mount table, so the
     # archive's original path stays visible without any extra binding.
-    unshare --user --map-root-user --pid --mount --ipc --uts --fork --kill-child -- \
-        bash -c 'mount -t proc proc /proc 2>/dev/null || true; cd "$1"; shift; exec "$@"' \
+    # As root, "unshare --user --map-root-user" alone isolates nothing on
+    # the filesystem: uid 0 inside is the real uid 0, every root-owned file
+    # stays writable (an extractor path-traversal bug = write anywhere).
+    # So root first becomes nobody, and only then enters the namespace.
+    local dropper=() owner=""
+    if [ "$(id -u)" = "0" ]; then
+        if _sandbox_has setpriv; then
+            dropper=(setpriv --reuid 65534 --regid 65534 --clear-groups); owner="65534:65534"
+        elif _sandbox_has runuser; then
+            dropper=(runuser -u "$SANDBOX_USER" --)
+            owner="$SANDBOX_USER:$(id -gn "$SANDBOX_USER" 2>/dev/null || echo "$SANDBOX_USER")"
+        else
+            _sandbox_run_simple "$target_dir" "$archive_src" "$@"; return
+        fi
+        chown "$owner" "$target_dir" 2>/dev/null
+        case "$archive_src" in
+            */av_arch_*_in.*/*) chown "$owner" "$(dirname "$archive_src")" "$archive_src" 2>/dev/null ;;
+        esac
+    fi
+    "${dropper[@]}" unshare --user --map-root-user --pid --mount --ipc --uts --fork --kill-child -- \
+        bash -c 'mount -t proc proc /proc 2>/dev/null || true; cd "$1" || exit 1; shift; exec "$@"' \
         _ "$target_dir" "$@"
 }
 
@@ -8398,6 +8547,7 @@ _archive_batch_hash_check() {
                 f="${_ARCH_NL_ORIG[$f]:-$f}"
                 rel="${f#$extract_dir/}"
                 [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
+                rel="${rel//|/?}"
                 threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel//$'\n'/?}|name=${tname:-Malware}|$htype=$hit_hash"
             done <<< "$out"
         done <<< "$hits"
@@ -8473,7 +8623,7 @@ _archive_batch_yara_check() {
         [ -n "$yfile" ] && yfile="${_ARCH_NL_ORIG[$yfile]:-$yfile}"
         rel="${yfile#$extract_dir/}"
         [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
-        rel="${rel//$'\n'/?}"
+        rel="${rel//$'\n'/?}"; rel="${rel//|/?}"
         if _is_builtin_noisy_rule "$yrule"; then
             SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
         elif spat=$(_resolve_str_sig "$yrule"); then
@@ -8657,7 +8807,7 @@ scan_archive() {
             { [ "${msize:-0}" -eq 0 ] || [ "${msize:-0}" -gt "$MAX_SIZE" ]; } && continue
             rel="${m#$extract_dir/}"
             [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
-            rel="${rel//$'\n'/?}"
+            rel="${rel//$'\n'/?}"; rel="${rel//|/?}"
 
             if [ "$HAS_STRINGS" = true ]; then
                 local sm
@@ -8719,6 +8869,15 @@ do_file_type() {
 # ----------------------------------------------------------------------------
 # Control chars (CR/LF/ESC...) masked: messages carry file / archive member
 # names, and a raw newline could forge a "THREAT:" line in the report.
+# Append one line to a report file, but never through a symlink: the report
+# may live in a directory somebody else can write to (default: the current
+# directory), where "<report>-PERMS" could be swapped for a link to
+# /etc/sudoers.
+_safe_append() {
+    [ -n "$1" ] || return 0
+    [ -L "$1" ] && return 0
+    printf '%s\n' "$2" >> "$1" 2>/dev/null
+}
 log() { local m="$*"; printf '[%s] %s\n' "$WORKER_ID" "${m//[$'\001'-$'\037'$'\177']/?}" >> "$REPORT"; }
 
 # threat() — single entry point for any finding: checks ignore_sigs first
@@ -8728,6 +8887,23 @@ log() { local m="$*"; printf '[%s] %s\n' "$WORKER_ID" "${m//[$'\001'-$'\037'$'\1
 # init_live_report in the main script), and quarantines the file if
 # enabled. Report line format ("TYPE|file|info") is unchanged so
 # build_report/print_report still work.
+# The line(s) ignore_sigs patterns are matched against: "TYPE|info|path".
+# The path is attacker-controlled, so its "|" are replaced: a directory
+# named "x|rule=Foo|" must not be able to satisfy a "rule=Foo[|]" line and
+# hide what is inside it. A second line carries the path relative to the
+# scan root (--offline-root, else -d), so a pattern can be anchored to the
+# start of the path ("[|]/usr/share/nmap/") and still work on a mounted
+# copy; an unanchored "[|][^|]*/usr/share/nmap/" also matches
+# /home/u/public_html/usr/share/nmap/ - avoid that form for system paths.
+_ign_lines() {
+    local t="$1" i="$2" f="${3//|/?}" r="${AV_SCAN_ROOT:-}"
+    printf '%s|%s|%s\n' "$t" "$i" "$f"
+    r="${r%/}"
+    if [ -n "$r" ]; then
+        r="${r//|/?}"
+        case "$f" in "$r"/*) printf '%s|%s|%s\n' "$t" "$i" "${f#"$r"}" ;; esac
+    fi
+}
 threat() {
     local type="$1" file="$2" info="${3:-}"
 
@@ -8756,13 +8932,13 @@ threat() {
     # tool's own filters, which is exactly what a deep/paranoid pass is
     # for.
     if [ "$DEEP_MODE" != "true" ] && [ -n "$IGNORE_SIGS_FILE" ] && [ -s "$_IGNORE_SIGS_FILTERED" ]; then
-        if printf '%s|%s|%s\n' "$type" "$info" "$file" | bb grep -qE -f "$_IGNORE_SIGS_FILTERED" 2>/dev/null; then
+        if _ign_lines "$type" "$info" "$file" | bb grep -qE -f "$_IGNORE_SIGS_FILTERED" 2>/dev/null; then
             SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
             if [ "$EXPLAIN_MODE" = true ]; then
                 local _pat _which=""
                 while IFS= read -r _pat; do
                     [ -n "$_pat" ] || continue
-                    printf '%s|%s|%s\n' "$type" "$info" "$file" | bb grep -qE -e "$_pat" 2>/dev/null && { _which="$_pat"; break; }
+                    _ign_lines "$type" "$info" "$file" | bb grep -qE -e "$_pat" 2>/dev/null && { _which="$_pat"; break; }
                 done < "$_IGNORE_SIGS_FILTERED"
                 EXPLAIN_SUPPRESSED=$(( EXPLAIN_SUPPRESSED + 1 ))
                 _xp "  suppressed  $type | $info  <- ignore_sigs line: $_which"
@@ -8775,7 +8951,8 @@ threat() {
     # CR is kept in this internal line on purpose (the incremental cache
     # matches its path against find's raw output); every human-facing copy
     # (live report below, save_report/print_report) masks all control chars.
-    printf 'THREAT:%s|%s|%s\n' "${type//$'\n'/?}" "${file//$'\n'/?}" "${info//$'\n'/?}" >> "$REPORT"
+    local _rf="${file//$'\n'/?}"      # a "|" in the path is stored as \034: the "|" stay separators
+    printf 'THREAT:%s|%s|%s\n' "${type//$'\n'/?}" "${_rf//|/$'\034'}" "${info//$'\n'/?}" >> "$REPORT"
     # Permission findings keep the THREAT: line (so -I rescans the file and
     # the report can list it) but count separately and never quarantine.
     # SUID/SGID: own counter too, unless the package checksum says the
@@ -8803,20 +8980,18 @@ threat() {
     # file — exactly what this feature exists to avoid. Routed to the
     # SAME companion file live now, not just at the end.
     if [ "$type" = "SUID_SGID" ]; then
-        if [ -n "$SUID_REPORT_FILE" ]; then
-            printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info" >> "$SUID_REPORT_FILE" 2>/dev/null
-        fi
+        _safe_append "$SUID_REPORT_FILE" "$(printf '[%s] [%s] %s %s' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info")"
         # a TAMPERED one is a threat: also in the main live log
-        if [ "${info#*TAMPERED}" != "$info" ] && [ -n "$LIVE_REPORT_FILE" ]; then
-            printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info" >> "$LIVE_REPORT_FILE" 2>/dev/null
+        if [ "${info#*TAMPERED}" != "$info" ]; then
+            _safe_append "$LIVE_REPORT_FILE" "$(printf '[%s] [%s] %s %s' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info")"
         fi
     elif [ "$_perm" = true ]; then
-        [ -n "$PERMS_REPORT_FILE" ] && printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info" >> "$PERMS_REPORT_FILE" 2>/dev/null
+        _safe_append "$PERMS_REPORT_FILE" "$(printf '[%s] [%s] %s %s' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info")"
     elif [ -n "$LIVE_REPORT_FILE" ]; then
         # Single printf = single write() syscall = atomic append even with
         # multiple worker processes writing the same file concurrently, as
         # long as the line stays under PIPE_BUF (a few KB) — safe here.
-        printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info" >> "$LIVE_REPORT_FILE" 2>/dev/null
+        _safe_append "$LIVE_REPORT_FILE" "$(printf '[%s] [%s] %s %s' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$m_type" "$m_file" "$m_info")"
     fi
     [ -n "$QUARANTINE_DIR" ] || return 0
     [ "$_perm" = true ] && return 0   # wrong mode is not malware: fix it, don't move it
@@ -8829,6 +9004,15 @@ threat() {
     quarantine_file "$file" "$type"
 }
 
+# A finding raised from inside quarantine_file (no ignore check, no second
+# quarantine attempt): report line + live log only.
+threat_note() {
+    local _ct=$'\001'-$'\037'
+    local _nf="${2//$'\n'/?}"
+    printf 'THREAT:%s|%s|%s\n' "$1" "${_nf//|/$'\034'}" "${3//$'\n'/?}" >> "$REPORT"
+    THREATS_FOUND=$(( THREATS_FOUND + 1 ))
+    _safe_append "$LIVE_REPORT_FILE" "$(printf '[%s] [%s] %s %s' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$1" "${2//[$_ct$'\177']/?}" "${3//[$_ct$'\177']/?}")"
+}
 progress() {
     printf 'FILES=%d\nTHREATS=%d\nPERMS=%d\nSUID=%d\nCURRENT=%s\n' \
         "$FILES_SCANNED" "$THREATS_FOUND" "$PERMS_FOUND" "$SUID_FOUND" "${1:-}" > "$PROGRESS"
@@ -8865,15 +9049,30 @@ quarantine_file() {
     [ -z "$path_hash" ] && path_hash="$(date +%s%N)_$$"
     qfile="${QUARANTINE_DIR}/${path_hash}_$(basename -- "$src")"
 
-    if mv -f -- "$src" "$qfile" 2>/dev/null; then
-        chmod "$QUARANTINE_PERM" "$qfile" 2>/dev/null
-        # Manifest for restore: original_path <TAB> quarantined_file <TAB>
-        # threat_type <TAB> unix_time. Restore = mv "$qfile" "$src".
-        printf '%s\t%s\t%s\t%s\n' "$src" "$qfile" "$type" "$ts" >> "${QUARANTINE_DIR}/manifest.tsv"
-        log "QUARANTINED: $src -> $qfile ($type)"
-    else
-        log "QUARANTINE_FAILED (mv error): $src ($type)"
+    # The file was read some time ago (a YARA batch reports when the whole
+    # batch is done). If a directory on the way was swapped for a symlink
+    # meanwhile, "mv $src" would move somebody else's file (/etc/passwd).
+    # Enter the directory first and check where we really are: once it is
+    # the current directory, renaming a parent no longer changes what the
+    # relative name points to.
+    local _qd="${src%/*}" _qb="${src##*/}"
+    [ -n "$_qd" ] || _qd="/"
+    if ! ( cd -P -- "$_qd" 2>/dev/null && [ "$(pwd -P)" = "$_qd" ] && [ -f "./$_qb" ] && [ ! -L "./$_qb" ] \
+           && mv -f -- "./$_qb" "$qfile" 2>/dev/null ); then
+        if [ "$(cd -P -- "$_qd" 2>/dev/null && pwd -P)" != "$_qd" ]; then
+            log "QUARANTINE_REFUSED (a directory in the path changed or is a symlink now - possible attempt to redirect the quarantine): $src ($type)"
+            threat_note "QUARANTINE_REFUSED" "$src" "path changed between scan and quarantine (symlink swap?)|not moved"
+        else
+            log "QUARANTINE_FAILED (mv error): $src ($type)"
+        fi
+        return 0
     fi
+    chmod "$QUARANTINE_PERM" "$qfile" 2>/dev/null
+    # Manifest for restore: original_path <TAB> quarantined_file <TAB>
+    # threat_type <TAB> unix_time. Restore = mv "$qfile" "$src" (check first
+    # that the original directory is still what you expect, not a symlink).
+    printf '%s\t%s\t%s\t%s\n' "$src" "$qfile" "$type" "$ts" >> "${QUARANTINE_DIR}/manifest.tsv"
+    log "QUARANTINED: $src -> $qfile ($type)"
 }
 
 # ----------------------------------------------------------------------------
@@ -9337,7 +9536,8 @@ check_file_heuristics() {
     if [ -n "${AV_IOC_PATH_ANY_RE:-}" ] && [[ "$file" =~ $AV_IOC_PATH_ANY_RE ]]; then
         threat "KNOWN_MALWARE_PATH" "$file" "ioc=${BASH_REMATCH[1]}|miner/botnet file name"
     elif [ -n "${AV_IOC_PATH_TMP_RE:-}" ] && [[ "$file" =~ $AV_IOC_PATH_TMP_RE ]]; then
-        threat "KNOWN_MALWARE_PATH" "$file" "ioc=${file##*/}|miner/botnet file name (temp or bin dir)"
+        local _ib="${file##*/}"
+        threat "KNOWN_MALWARE_PATH" "$file" "ioc=${_ib//|/?}|miner/botnet file name (temp or bin dir)"
     fi
 
     # Executables in temp dirs (/tmp, /var/tmp, /dev/shm and per-site tmp/,
