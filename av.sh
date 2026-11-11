@@ -3078,38 +3078,7 @@ YARA_BUILTIN_EXCLUDE="antidebug_antivm.yar crypto_signatures.yar domain.yar RAT_
 # Profiles: all     = everything incl. legacy,
 #           server  = everything except legacy,
 #           hosting = webshell+webapp+linux+exploit (light, opt-in).
-_yara_category() {
-    local p b
-    p=$(printf '%s' "$1" | tr 'A-Z' 'a-z'); b=${p##*/}
-    case "$p" in
-        */signature-base/yara/*|*/signature-base/vendor/*|*/signature-base/tests/*|*/yara/rules/*) ;;
-        *) echo "-"; return ;;
-    esac
-    case "$b" in index.yar|*_index.yar|index_*.yar) echo index; return ;; esac
-    case "$p" in
-        */signature-base/tests/*|*/signature-base/vendor/*|*/yara/rules/antidebug_antivm/*|*/yara/rules/capabilities/*|\
-        */yara/rules/crypto/*|*/yara/rules/packers/*|*/yara/rules/utils/*|*/yara/rules/deprecated/*|*/yara/rules/mobile_malware/*)
-            echo legacy; return ;;
-        */yara/rules/webshells/*) echo webshell; return ;;
-    esac
-    case "$b" in
-        *webshell*) echo webshell ;;
-        *linux*|*lnx*|*elf_*|*_elf*|*mirai*) echo linux ;;
-        *php*|*wordpress*|*joomla*|*drupal*|*magento*|*skimmer*|*magecart*|*javascript*|*obfuscatorio*|*_js_*|*_js.yar|js_*) echo webapp ;;
-        expl_*|exploit_*|vul_*|vuln_*) echo exploit ;;
-        *maldoc*|*phish*) echo docs ;;
-        *)
-            case "$p" in
-                */yara/rules/exploit_kits/*|*/yara/rules/cve_rules/*) echo exploit ;;
-                */yara/rules/maldocs/*|*/yara/rules/email/*)          echo docs ;;
-                */yara/rules/malware/*)                                echo malware ;;
-                *)  case "$b" in
-                        apt_*|crime_*|mal_*|hktl_*|spy_*|threat_*|pua_*|cn_*|seaspy_*) echo malware ;;
-                        *) echo generic ;;
-                    esac ;;
-            esac ;;
-    esac
-}
+_yara_category() { _yara_category_set "$1"; echo "$_YCAT"; }
 
 # $1 = comma-separated list of categories/profiles; exits non-zero with a
 # message on anything unknown, so a typo can't silently load nothing.
@@ -3267,12 +3236,45 @@ _yara_name_excluded() {
 # selected, its name is excluded, or it is an index-like file that INCLUDEs
 # an excluded one (the index `-u` builds uses absolute include paths and
 # would pull excluded rules straight back in).
+# _yara_category without the "$(...)" subshell and the tr fork: result in $_YCAT
+_yara_category_set() {
+    local p="${1,,}" b
+    b="${p##*/}"
+    case "$p" in
+        */signature-base/yara/*|*/signature-base/vendor/*|*/signature-base/tests/*|*/yara/rules/*) ;;
+        *) _YCAT="-"; return ;;
+    esac
+    case "$b" in index.yar|*_index.yar|index_*.yar) _YCAT=index; return ;; esac
+    case "$p" in
+        */signature-base/tests/*|*/signature-base/vendor/*|*/yara/rules/antidebug_antivm/*|*/yara/rules/capabilities/*|\
+        */yara/rules/crypto/*|*/yara/rules/packers/*|*/yara/rules/utils/*|*/yara/rules/deprecated/*|*/yara/rules/mobile_malware/*)
+            _YCAT=legacy; return ;;
+        */yara/rules/webshells/*) _YCAT=webshell; return ;;
+    esac
+    case "$b" in
+        *webshell*) _YCAT=webshell ;;
+        *linux*|*lnx*|*elf_*|*_elf*|*mirai*) _YCAT=linux ;;
+        *php*|*wordpress*|*joomla*|*drupal*|*magento*|*skimmer*|*magecart*|*javascript*|*obfuscatorio*|*_js_*|*_js.yar|js_*) _YCAT=webapp ;;
+        expl_*|exploit_*|vul_*|vuln_*) _YCAT=exploit ;;
+        *maldoc*|*phish*) _YCAT=docs ;;
+        *)
+            case "$p" in
+                */yara/rules/exploit_kits/*|*/yara/rules/cve_rules/*) _YCAT=exploit ;;
+                */yara/rules/maldocs/*|*/yara/rules/email/*)          _YCAT=docs ;;
+                */yara/rules/malware/*)                                _YCAT=malware ;;
+                *)  case "$b" in
+                        apt_*|crime_*|mal_*|hktl_*|spy_*|threat_*|pua_*|cn_*|seaspy_*) _YCAT=malware ;;
+                        *) _YCAT=generic ;;
+                    esac ;;
+            esac ;;
+    esac
+}
 _yara_file_excluded() {
     local f="$1" list="$2" cat inc
     [ -z "$YARA_CATS" ] && _yara_expand_profile
     # index files only "include" the others (index_w_mobile.yar: 480 lines)
     case "${f##*/}" in index.yar|*_index.yar|index_*.yar) return 0 ;; esac
-    cat=$(_yara_category "$f")
+    _yara_category_set "$f"; cat=$_YCAT
     if [ "$cat" != "-" ]; then
         case " $YARA_CATS " in *" $cat "*) ;; *) return 0 ;; esac
     fi
@@ -4496,15 +4498,49 @@ EOF
         SLOW_DROPPED=0
         local n_ign=0 n_slow=0 vout k sn
         : > "$ydropped"
+        # Validation cache: checking one rule file costs two or three yarac
+        # runs, and a "git pull" of the rule repositories changes a handful
+        # of the ~1200 files. The verdict for a file (usable / not, how many
+        # rules were cut out, the cleaned-up text if it was changed) is kept
+        # under .cache/yara_checked/, keyed by the file's md5 plus everything
+        # the verdict depends on (strip list, pack "full", yarac version).
+        local yck="$cache_dir/yara_checked" ygk="" ce st ki ks changed ybn yhit=0 ymiss=0
+        local -A ysum=()
+        if [ "$MD5_CMD" != "none" ] && mkdir -p "$yck" 2>/dev/null; then
+            ygk=$( { cat "$strip_names" 2>/dev/null; echo "all=$YARA_ALL|cf$CACHE_FORMAT|$("$YARAC_BIN" --version 2>/dev/null)"; } | $MD5_CMD 2>/dev/null | cut -c1-32)
+            local _h _f
+            while read -r _h _f; do
+                [ "${#_h}" = 32 ] && ysum["$_f"]="$_h"
+            done < <(printf '%s\n' "$yar_sources" | bb grep -v '/generated_ndb_ldb\.' | tr '\n' '\0' | xargs -0 $MD5_CMD 2>/dev/null)
+            find "$yck" -type f -mtime +60 -delete 2>/dev/null
+        fi
         while IFS= read -r yf; do
             [ -z "$yf" ] && continue
-            case "${yf##*/}" in generated_ndb_ldb.*.yar) ;;
-            *)
+            ybn="${yf##*/}"
+            case "$ybn" in generated_ndb_ldb.*.yar)
+                # our own converter's output (one file per ClamAV target
+                # group): not validated separately (see _yara_compile_ns)
+                gen_file="$yf"
+                echo "include \"$ybn\"" >> "$yara_index"
+                yara_ns_args+=("n${included}:$yf")
+                included=$((included + 1))
+                continue ;;
+            esac
+            ce=""; st=""; ki=0; ks=0; changed=false
+            [ -n "$ygk" ] && [ -n "${ysum[$yf]:-}" ] && ce="$yck/${ygk}_${ysum[$yf]}"
+            if [ -n "$ce" ] && [ -f "$ce.st" ] && read -r st ki ks < "$ce.st" && [[ "$st" =~ ^(ok|skip)$ && "$ki" =~ ^[0-9]+$ && "$ks" =~ ^[0-9]+$ ]]; then
+                # cached verdict
+                [ -f "$ce.yar" ] && cp -f "$ce.yar" "$yf"
+                [ -s "$ce.drop" ] && bb awk -F'\t' -v f="$ybn" 'BEGIN { OFS = "\t" } { $2 = f; print }' "$ce.drop" >> "$ydropped"
+                yhit=$((yhit + 1))
+            else
+                st=""; ki=0; ks=0; ymiss=$((ymiss + 1))
+                : > "$yf.drop"
                 if [ -s "$strip_names" ] && bb grep -qwFf "$strip_names" "$yf" 2>/dev/null; then
                     cp -f "$yf" "$yf.orig"
                     k=$(_yara_strip_rules "$yf" "$strip_names")
                     if [ "$k" -gt 0 ] && "$YARAC_BIN" "${yara_extvars[@]}" "$yf" /dev/null &>/dev/null; then
-                        n_ign=$(( n_ign + k )); printf 'ignored\t%s\t%s rule(s)\n' "${yf##*/}" "$k" >> "$ydropped"
+                        ki=$k; changed=true; printf 'ignored\t%s\t%s rule(s)\n' "$ybn" "$k" >> "$yf.drop"
                     else
                         mv -f "$yf.orig" "$yf"
                     fi
@@ -4512,34 +4548,37 @@ EOF
                 fi
                 if [ "$YARA_ALL" != true ]; then
                     vout=$("$YARAC_BIN" "${yara_extvars[@]}" "$yf" /dev/null 2>&1 >/dev/null)
-                    sn=$(printf '%s\n' "$vout" | bb sed -nE 's/.*warning: rule "([A-Za-z0-9_]+)".*may slow down scanning.*/\1/p' | bb sort -u)
+                    sn=$(bb sed -nE 's/.*warning: rule "([A-Za-z0-9_]+)".*may slow down scanning.*/\1/p' <<< "$vout" | bb sort -u)
                     if [ -n "$sn" ]; then
                         printf '%s\n' "$sn" > "$yf.slow"; cp -f "$yf" "$yf.orig"
                         k=$(_yara_strip_rules "$yf" "$yf.slow")
                         if [ "$k" -gt 0 ] && "$YARAC_BIN" "${yara_extvars[@]}" "$yf" /dev/null &>/dev/null; then
-                            n_slow=$(( n_slow + k ))
-                            printf '%s\n' "$sn" | bb awk -v f="${yf##*/}" '{ print "too-general\t" f "\t" $0 }' >> "$ydropped"
+                            ks=$k; changed=true
+                            bb awk -v f="$ybn" '{ print "too-general\t" f "\t" $0 }' <<< "$sn" >> "$yf.drop"
                         else
                             mv -f "$yf.orig" "$yf"
                         fi
                         rm -f "$yf.orig" "$yf.slow"
                     fi
-                fi ;;
-            esac
-            case "${yf##*/}" in generated_ndb_ldb.*.yar)
-                # our own converter's output (one file per ClamAV target
-                # group): not validated separately (see _yara_compile_ns)
-                gen_file="$yf"
-                echo "include \"${yf##*/}\"" >> "$yara_index"
-                yara_ns_args+=("n${included}:$yf")
-                included=$((included + 1))
-                continue ;;
-            esac
-            if "$YARAC_BIN" "${yara_extvars[@]}" "$yf" /dev/null &>/dev/null || _yara_fix_dup_names "$yf"; then
+                fi
+                if "$YARAC_BIN" "${yara_extvars[@]}" "$yf" /dev/null &>/dev/null; then st=ok
+                elif _yara_fix_dup_names "$yf"; then st=ok; changed=true
+                else st=skip; fi
+                [ -s "$yf.drop" ] && cat "$yf.drop" >> "$ydropped"
+                if [ -n "$ce" ]; then
+                    rm -f "$ce.yar" "$ce.drop"
+                    [ "$changed" = true ] && [ "$st" = ok ] && cp -f "$yf" "$ce.yar"
+                    [ -s "$yf.drop" ] && cp -f "$yf.drop" "$ce.drop"
+                    printf '%s %s %s\n' "$st" "$ki" "$ks" > "$ce.st.$$" && mv -f "$ce.st.$$" "$ce.st"
+                fi
+                rm -f "$yf.drop"
+            fi
+            n_ign=$(( n_ign + ki )); n_slow=$(( n_slow + ks ))
+            if [ "$st" = ok ]; then
                 # RELATIVE include: index.yar is cached in the pack and used
                 # from another (per-run) dir later; YARA resolves an include
                 # against the including file's own dir
-                echo "include \"${yf##*/}\"" >> "$yara_index"
+                echo "include \"$ybn\"" >> "$yara_index"
                 # one NAMESPACE per file: the same rule name legitimately
                 # exists in both community repos (e.g. the Laudanum webshell
                 # rules), and a single combined namespace makes yarac refuse
@@ -4550,6 +4589,7 @@ EOF
                 skipped=$((skipped + 1))
             fi
         done <<< "$yar_sources"
+        [ "$yhit" -gt 0 ] && echo "  [*] YARA rule files: ${yhit} unchanged since the last check (verdict reused), ${ymiss} checked now"
         [ "$skipped" -gt 0 ] && echo -e "${Y}[WARN] Skipped ${skipped} incompatible YARA rule file(s) (unsupported module/syntax) — ${included} included${Z}"
         IGN_DROPPED_CLAM=$(bb awk '{ s += $1 } END { print s + 0 }' "$out_dir/ign_clam.cnt" 2>/dev/null); IGN_DROPPED_CLAM=${IGN_DROPPED_CLAM:-0}
         [ $(( n_ign + n_slow + IGN_DROPPED_CLAM )) -gt 0 ] && echo "  [*] Left out at compile time: ${IGN_DROPPED_CLAM} ClamAV signature(s) and ${n_ign} YARA rule(s) on ignore lists / always suppressed, ${n_slow} YARA rule(s) yarac calls too general (list: <pack>/dropped_rules.txt)"
