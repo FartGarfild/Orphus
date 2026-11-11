@@ -12,3 +12,4 @@ signatures/custom/*
 !signatures/yara/
 signatures/yara/*
 !signatures/yara/orphus-shared/
+bin/yarax-shim/
