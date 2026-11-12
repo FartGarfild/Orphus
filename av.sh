@@ -6447,7 +6447,18 @@ show_progress() {
         # from the hashing workers, so "Workers a/b" never reads 2/1
         if [ -n "${YARA_CONSUMER_PID:-}" ]; then
             if kill -0 "$YARA_CONSUMER_PID" 2>/dev/null; then
-                active_pids+=("$YARA_CONSUMER_PID"); ylab="  YARA: ${YARA_THREADS:-1} thr"
+                # "Files" counts what the workers have hashed; YARA runs behind
+                # them on its own queue, so its progress is shown separately
+                local yd=0 yl=0 yeta=0
+                read -r yd 2>/dev/null < "$WORK_DIR/reports/.yq/.done_count"; yd=${yd:-0}
+                yl=$(cat "$WORK_DIR/reports/.yq"/*.lst 2>/dev/null | tr -cd '\0' | wc -c); yl=${yl:-0}
+                active_pids+=("$YARA_CONSUMER_PID"); ylab="  YARA: ${yd} done, ${yl} waiting"
+                if [ "$yl" -gt 0 ] && [ "$yd" -gt 0 ] && [ "$elapsed_s" -gt 0 ]; then
+                    local yr_=$(( yl * elapsed_s / yd ))
+                    # the slower of the two decides when the scan ends
+                    case "$eta" in --:--) yeta=0 ;; *) yeta=$(( 10#${eta%%:*} * 60 + 10#${eta##*:} )) ;; esac
+                    [ "$yr_" -gt "$yeta" ] && eta=$(printf '%02d:%02d' $(( yr_/60 )) $(( yr_%60 )))
+                fi
             else ylab="  YARA: done"; fi
         fi
         for pid in "${WORKER_PIDS[@]}"; do
@@ -10217,6 +10228,8 @@ run_yara_consumer() {
         done
         if [ "${#batch[@]}" -gt 0 ]; then
             _timed_yara_batch "${batch[@]}"
+            YQ_DONE=$(( ${YQ_DONE:-0} + ${#batch[@]} ))
+            echo "$YQ_DONE" > "$q/.done_count.tmp" 2>/dev/null && mv -f "$q/.done_count.tmp" "$q/.done_count" 2>/dev/null
             progress "yara"
             continue
         fi
