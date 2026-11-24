@@ -49,3 +49,23 @@ rule Orphus_IOC_C2_66_245_217_135
     condition:
         any of them
 }
+rule WP_GAwp_ClickFix_Backdoor_Cluster {
+    meta:
+        description = "GAwp Fake Cloudflare / ClickFix + Cookie/Entity PHP Shells"
+    strings:
+        $gawp1 = "wp-checker-install:" ascii
+        $gawp2 = "GANALYTICS_HOOKS_ACTIVE" ascii
+        $gawp3 = "R0FOQUxZVElDU19IT09LU19BQ1RJVkU=" ascii
+        $gawp4 = "ZmtyY19zaG93bg==" ascii
+        $gawp5 = "__ga_snippet_marker" ascii
+        $gawp6 = "/api/sites/setup-credentials" ascii
+
+        $cookie1 = "spl_autoload_register(\"buffer_cache\")" ascii
+        $cookie2 = "base64_decode(str_rot13($object[3]))" ascii
+        $cookie3 = "hub_center_settings" ascii
+
+        $entity1 = "vsprintf(\"%s/%s\", [$object, \".rec\"])" ascii
+        $entity2 = "$d = ( ( int)$v3 - $chS -( $o %10)) ^ 80;" ascii
+    condition:
+        any of them
+}
