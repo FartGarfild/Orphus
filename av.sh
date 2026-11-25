@@ -1084,8 +1084,14 @@ net_fetch() {
 # (SETUP_*_VERSION) or URL (--busybox-url, --yara-url) is not checked
 # against them.
 PIN_BUSYBOX_X86_64="${ORPHUS_PIN_BUSYBOX_X86_64:-}"     # busybox 1.35.0 x86_64 musl (busybox.net)
-PIN_YARA_SRC="${ORPHUS_PIN_YARA_SRC:-}"                 # yara v4.5.8 source tarball (GitHub tag archive)
-PIN_GREP_SRC="${ORPHUS_PIN_GREP_SRC:-}"                 # grep-3.11.tar.gz
+# yara v4.5.8 GitHub tag archive: GitHub generates these on the fly, and in
+# 2023 a compression change altered such hashes without any tampering, so a
+# mismatch here only WARNS. The value equals `git archive` of tag v4.5.8
+# (gzip -n), i.e. it is reproducible from the git history itself.
+PIN_YARA_SRC="${ORPHUS_PIN_YARA_SRC-c322414975ff6f701149856613afdcd92a7e6939c284c798ae3c85618197efaa}"
+# grep-3.11.tar.gz: the sha256 from the official release announcement
+# (savannah.gnu.org/news/?id=10364, given there in base64).
+PIN_GREP_SRC="${ORPHUS_PIN_GREP_SRC-1f31014953e71c3cddcedb97692ad7620cb9d6d04fbdc19e0d8dd836f87622bb}"
 PIN_BASH_SRC="${ORPHUS_PIN_BASH_SRC:-}"                 # bash-5.2.21.tar.gz
 _sha256_of() {
     if command -v sha256sum &>/dev/null; then sha256sum "$1" 2>/dev/null | cut -d' ' -f1
@@ -1093,8 +1099,8 @@ _sha256_of() {
     elif command -v openssl &>/dev/null; then openssl dgst -sha256 "$1" 2>/dev/null | sed 's/.* //'
     fi
 }
-_pin_check() {   # file, what, pin -> 0 ok / not pinned, 1 mismatch
-    local f="$1" what="$2" pin="$3" h
+_pin_check() {   # file, what, pin [warn] -> 0 ok / not pinned, 1 mismatch
+    local f="$1" what="$2" pin="$3" soft="${4:-}" h
     h=$(_sha256_of "$f")
     if [ -z "$h" ]; then
         echo -e "${Y}[WARN] cannot compute sha256 of ${what} (no sha256sum/shasum/openssl) -> not verified${Z}"
@@ -1107,7 +1113,61 @@ _pin_check() {   # file, what, pin -> 0 ok / not pinned, 1 mismatch
     if [ "$h" = "$pin" ]; then
         echo -e "${G}[OK] ${what}: sha256 matches the pinned checksum${Z}"; return 0
     fi
+    if [ "$soft" = warn ]; then
+        echo -e "${Y}[WARN] ${what}: sha256 ${h} differs from the pinned ${pin} - GitHub regenerates tag archives and their hashes have changed before without tampering; continuing, but compare it with the release${Z}"
+        return 0
+    fi
     echo -e "${R}[FAIL] ${what}: sha256 ${h} does NOT match the pinned ${pin} -> refusing to use it (tampered download or a mirror serving something else)${Z}"
+    return 1
+}
+
+# GNU release signatures. Each tarball has a detached .sig next to it; the
+# keyring comes from the GNU site too, so on its own it proves nothing - what
+# counts is that the signature is VALID and made by one of these keys
+# (primary-key fingerprints from the release announcements). A swapped
+# tarball + swapped keyring cannot produce that. Unlike a sha256 pin this
+# survives version bumps: the same maintainer signs the next release.
+#   grep: Jim Meyering   bash: Chet Ramey
+GNU_SIGNERS_GREP="${ORPHUS_GNU_SIGNERS_GREP:-155D3FC500C834486D1EEA677FD9FCCB000BEEEE}"
+GNU_SIGNERS_BASH="${ORPHUS_GNU_SIGNERS_BASH:-7C0135FB088AAF6C66C650B9BB5869F064EA74AB}"
+GNU_KEYRING_URLS="${ORPHUS_GNU_KEYRING_URL:-https://ftp.gnu.org/gnu/gnu-keyring.gpg https://ftpmirror.gnu.org/gnu-keyring.gpg}"
+# $1 tarball  $2 url it came from  $3 what  $4 allowed fingerprints
+# 0 = verified, or could not be checked (warned; the sha256 pin, if any,
+#     still applies), 1 = BAD signature or a signer not on the list
+_gnu_sig_check() {
+    local f="$1" url="$2" what="$3" allowed="$4" d gv="" st fpr k ku
+    if command -v gpgv &>/dev/null; then gv=gpgv
+    elif command -v gpg &>/dev/null; then gv="gpg --batch --no-default-keyring --no-auto-key-retrieve --verify"
+    else
+        echo -e "${Y}[WARN] ${what}: gpg/gpgv not installed -> GNU signature not checked (apt install gpgv)${Z}"; return 0
+    fi
+    d=$(mktemp -d 2>/dev/null) || return 0
+    if ! net_fetch "${url}.sig" "$d/sig" 30 >/dev/null 2>&1 || [ ! -s "$d/sig" ]; then
+        echo -e "${Y}[WARN] ${what}: could not download ${url##*/}.sig -> signature not checked${Z}"; rm -rf "$d"; return 0
+    fi
+    k=""
+    for ku in $GNU_KEYRING_URLS; do
+        case "$ku" in /*) [ -s "$ku" ] && cp "$ku" "$d/keyring.gpg" && k=1 ;; *) net_fetch "$ku" "$d/keyring.gpg" 60 >/dev/null 2>&1 && [ -s "$d/keyring.gpg" ] && k=1 ;; esac
+        [ -n "$k" ] && break
+    done
+    if [ -z "$k" ]; then
+        echo -e "${Y}[WARN] ${what}: could not download the GNU keyring -> signature not checked${Z}"; rm -rf "$d"; return 0
+    fi
+    # status lines only; HOME/GNUPGHOME private so nothing is read or written
+    # in the user's own keyring
+    st=$(GNUPGHOME="$d" HOME="$d" $gv --status-fd 1 --keyring "$d/keyring.gpg" "$d/sig" "$f" 2>/dev/null)
+    fpr=$(printf '%s\n' "$st" | awk '$2=="VALIDSIG" { print toupper($NF) }' | head -1)
+    rm -rf "$d"
+    if [ -z "$fpr" ]; then
+        if printf '%s\n' "$st" | grep -qE 'BADSIG|ERRSIG'; then
+            echo -e "${R}[FAIL] ${what}: GNU signature check FAILED -> refusing to use it (tampered or broken download)${Z}"; return 1
+        fi
+        echo -e "${Y}[WARN] ${what}: signature could not be verified (signing key not in the GNU keyring?) -> not checked${Z}"; return 0
+    fi
+    case " $allowed " in *" $fpr "*)
+        echo -e "${G}[OK] ${what}: GNU signature valid (key ${fpr})${Z}"; return 0 ;;
+    esac
+    echo -e "${R}[FAIL] ${what}: signed by key ${fpr}, which is not the expected maintainer (${allowed}) -> refusing to use it${Z}"
     return 1
 }
 
@@ -1773,7 +1833,7 @@ build_yara_from_source() {
         rm -rf "$workdir"
         return 1
     fi
-    _pin_check "$workdir/yara.tar.gz" "yara source" "$([ -z "${SETUP_YARA_VERSION:-}" ] && echo "$PIN_YARA_SRC")" || { rm -rf "$workdir"; return 1; }
+    _pin_check "$workdir/yara.tar.gz" "yara source" "$([ -z "${SETUP_YARA_VERSION:-}" ] && echo "$PIN_YARA_SRC")" warn
     tar -xzf "$workdir/yara.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
 
     (
@@ -1862,6 +1922,7 @@ build_grep_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    _gnu_sig_check "$workdir/grep.tar.gz" "$gurl" "grep source" "$GNU_SIGNERS_GREP" || { rm -rf "$workdir"; return 1; }
     _pin_check "$workdir/grep.tar.gz" "grep source" "$([ -z "${SETUP_GREP_VERSION:-}" ] && echo "$PIN_GREP_SRC")" || { rm -rf "$workdir"; return 1; }
     tar -xzf "$workdir/grep.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
 
@@ -1952,6 +2013,7 @@ build_bash_from_source() {
         rm -rf "$workdir"
         return 1
     fi
+    _gnu_sig_check "$workdir/bash.tar.gz" "$burl" "bash source" "$GNU_SIGNERS_BASH" || { rm -rf "$workdir"; return 1; }
     _pin_check "$workdir/bash.tar.gz" "bash source" "$([ -z "${SETUP_BASH_VERSION:-}" ] && echo "$PIN_BASH_SRC")" || { rm -rf "$workdir"; return 1; }
     tar -xzf "$workdir/bash.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
 
